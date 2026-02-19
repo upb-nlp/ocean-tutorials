@@ -1,7 +1,7 @@
 import os
 import argparse
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Type, Callable, Union
 
 import numpy as np
 import pandas as pd
@@ -9,9 +9,9 @@ import torch
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader
 
-import pytorch_lightning as pl
-from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
-from pytorch_lightning.loggers import TensorBoardLogger
+import lightning as L
+from lightning.pytorch.loggers import WandbLogger
+from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping
 
 from transformers import (
     AutoTokenizer,
@@ -20,41 +20,82 @@ from transformers import (
     AdamW,
 )
 
-from datasets import Dataset
-
+from datasets import Dataset, load_dataset
 from sklearn.metrics import f1_score, accuracy_score
+from wandb import login
 
 
-# -------------------------
-# Config
-# -------------------------
+# -----------------------------
+# Data
+# -----------------------------
 @dataclass
-class Config:
-    model_name: str = "google-bert/bert-base-uncased"
-    num_epochs: int = 5
-    batch_size: int = 8
-    grad_accum: int = 2
-    lr: float = 5e-5
-    max_length: int = 512
-    num_labels1: int = 5
-    num_labels2: int = 2
-    early_stop_patience: int = 3
-    num_workers: int = 0
+class Batch:
+    input_ids: torch.Tensor
+    attention_mask: torch.Tensor
+    labels: torch.Tensor
+
+dataclass(frozen=True)
+class EncoderSpec:
+    saved_model_name: str
+    datamodule_cls: Type[Any]
+    lit_model_cls: Type[Any]
+    eval_fn: Callable[..., Dict[str, float]]
+    monitor_metric: str = "val/loss"
+    monitor_mode: str = "min"
+
+
+def get_encoder_spec(version: int) -> EncoderSpec:
+    specs: Dict[int, EncoderSpec] = {
+        1: EncoderSpec(
+            saved_model_name="saved_encoder_model_v1",
+            datamodule_cls=EncoderDataModuleV1,
+            lit_model_cls=EncoderLightningModuleV1,
+            eval_fn=evaluate_best_v1,
+        ),
+        2: EncoderSpec(
+            saved_model_name="saved_encoder_model_v2",
+            datamodule_cls=EncoderDataModuleV2,
+            lit_model_cls=EncoderLightningModuleV2,
+            eval_fn=evaluate_best_v2,
+        ),
+    }
+    if version not in specs:
+        raise ValueError(f"Unknown VERSION={version}. Supported: {list(specs)}")
+    return specs[version]
+
+
+def resolve_best_ckpt(checkpoint_cb: ModelCheckpoint, ckpt_dir: str) -> str:
+    best = checkpoint_cb.best_model_path
+
+    # If eval_only, callback may not run — fall back to conventional names.
+    if not best:
+        for candidate in (
+            os.path.join(ckpt_dir, "best.ckpt"),
+            os.path.join(ckpt_dir, "best"),
+            os.path.join(ckpt_dir, "last.ckpt"),
+        ):
+            if os.path.exists(candidate):
+                best = candidate
+                break
+
+    if not best or not os.path.exists(best):
+        raise FileNotFoundError(f"Could not find checkpoint in {ckpt_dir}")
+    return best
 
 
 # -------------------------
 # Version 1 model (2 heads)
 # -------------------------
-class BertWithTwoHeads(torch.nn.Module):
+class EncoderWithTwoHeads(torch.nn.Module):
     def __init__(self, model_name: str, num_labels1: int = 5, num_labels2: int = 2):
         super().__init__()
-        self.bert = AutoModel.from_pretrained(model_name)
-        hidden_size = self.bert.config.hidden_size
+        self.backbone = AutoModel.from_pretrained(model_name)
+        hidden_size = self.backbone.config.hidden_size
         self.classifier1 = torch.nn.Linear(hidden_size, num_labels1)
         self.classifier2 = torch.nn.Linear(hidden_size, num_labels2)
 
     def forward(self, input_ids, attention_mask=None):
-        outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+        outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
         pooled = outputs.pooler_output  # [B, H]
         logits1 = self.classifier1(pooled)
         logits2 = self.classifier2(pooled)
@@ -64,33 +105,58 @@ class BertWithTwoHeads(torch.nn.Module):
 # -------------------------
 # DataModules
 # -------------------------
-class EncoderDataModuleV1(pl.LightningDataModule):
+class EncoderDataModuleV1(L.LightningDataModule):
     def __init__(
         self,
-        cfg: Config,
-        dataset_df: pd.DataFrame,
-        dataset_train: List[Dict[str, Any]],
-        dataset_val: List[Dict[str, Any]],
-        dataset_test: List[Dict[str, Any]],
+        dataset_name: str,
+        tokenizer_name: str,
+        max_length: int,
+        batch_size: int,
+        num_workers: int,
+        seed: int,
     ):
         super().__init__()
-        self.cfg = cfg
-        self.dataset_df = dataset_df
-        self.dataset_train_raw = dataset_train
-        self.dataset_val_raw = dataset_val
-        self.dataset_test_raw = dataset_test
+        self.dataset_name = dataset_name
+        self.tokenizer_name = tokenizer_name
+        self.max_length = max_length
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.seed = seed
 
-        self.tokenizer = AutoTokenizer.from_pretrained(cfg.model_name)
+    def prepare_data(self):
+        # Load dataset and tokenizer
+        load_dataset(self.dataset_name, split=self.train_split)
+        AutoTokenizer.from_pretrained(self.tokenizer_name)
+
+    # Continue from here
+    def setup(self, stage: Optional[str] = None):
+
+        self.tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name)
+        self.dataset = load_dataset(self.dataset_name)
+        self.train = self.dataset["train"]
+        self.val = self.dataset["validation"]
+        self.test = self.dataset["test"]
 
         # label maps
-        self.condition_map = {label: i for i, label in enumerate(pd.unique(dataset_df["condition"]))}
+        self.condition_map = {label: i for i, label in enumerate(pd.unique(self.train["condition"]))}
         self.reverse_condition_map = {v: k for k, v in self.condition_map.items()}
-        self.record_type_map = {label: i for i, label in enumerate(pd.unique(dataset_df["record_type"]))}
+        self.record_type_map = {label: i for i, label in enumerate(pd.unique(self.train["record_type"]))}
         self.reverse_record_type_map = {v: k for k, v in self.record_type_map.items()}
 
-        self.train_ds = None
-        self.val_ds = None
-        self.test_ds = None
+        train = Dataset.from_list(self.dataset_train_raw).map(
+            self.tokenize_function,
+            batched=False,
+            remove_columns=["text", "condition", "record_type"],
+        )
+        val = Dataset.from_list(self.dataset_val_raw).map(
+            self.tokenize_function,
+            batched=False,
+            remove_columns=["text", "condition", "record_type"],
+        )
+        test = Dataset.from_list(self.dataset_test_raw)  # keep raw for inference later
+        self.train_ds = train
+        self.val_ds = val
+        self.test_ds = test
 
     def tokenize_function(self, example: Dict[str, Any]) -> Dict[str, Any]:
         inputs = self.tokenizer(
@@ -123,22 +189,6 @@ class EncoderDataModuleV1(pl.LightningDataModule):
             "label2": label2,
         }
 
-    def setup(self, stage: Optional[str] = None):
-        train = Dataset.from_list(self.dataset_train_raw).map(
-            self.tokenize_function,
-            batched=False,
-            remove_columns=["text", "condition", "record_type"],
-        )
-        val = Dataset.from_list(self.dataset_val_raw).map(
-            self.tokenize_function,
-            batched=False,
-            remove_columns=["text", "condition", "record_type"],
-        )
-        test = Dataset.from_list(self.dataset_test_raw)  # keep raw for inference later
-        self.train_ds = train
-        self.val_ds = val
-        self.test_ds = test
-
     def train_dataloader(self):
         return DataLoader(
             self.train_ds,
@@ -158,7 +208,7 @@ class EncoderDataModuleV1(pl.LightningDataModule):
         )
 
 
-class EncoderDataModuleV2(pl.LightningDataModule):
+class EncoderDataModuleV2(L.LightningDataModule):
     """
     MLM prompt formulation. We also compute max_tokens from label strings (condition + record_type).
     """
@@ -287,13 +337,13 @@ class EncoderDataModuleV2(pl.LightningDataModule):
 # -------------------------
 # LightningModules
 # -------------------------
-class EncoderLightningModuleV1(pl.LightningModule):
+class EncoderLightningModuleV1(L.LightningModule):
     def __init__(self, cfg: Config):
         super().__init__()
         self.cfg = cfg
         self.save_hyperparameters()
 
-        self.model = BertWithTwoHeads(cfg.model_name, cfg.num_labels1, cfg.num_labels2)
+        self.model = EncoderWithTwoHeads(cfg.model_name, cfg.num_labels1, cfg.num_labels2)
         self.loss_fn1 = torch.nn.CrossEntropyLoss()
         self.loss_fn2 = torch.nn.CrossEntropyLoss()
 
@@ -361,7 +411,7 @@ class EncoderLightningModuleV1(pl.LightningModule):
         return AdamW(self.parameters(), lr=self.cfg.lr)
 
 
-class EncoderLightningModuleV2(pl.LightningModule):
+class EncoderLightningModuleV2(L.LightningModule):
     def __init__(self, cfg: Config):
         super().__init__()
         self.cfg = cfg
@@ -501,93 +551,157 @@ def evaluate_best_v2(
     }
 
 
-# -------------------------
-# Main
-# -------------------------
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--version", type=int, choices=[1, 2], required=True, help="Encoder version: 1 or 2")
-    parser.add_argument("--save_dir", type=str, default="./checkpoints", help="Root checkpoint directory")
-    parser.add_argument("--run_name", type=str, default=None, help="Optional run name")
-    parser.add_argument("--eval_only", action="store_true", help="Skip training; evaluate best checkpoint")
-    args = parser.parse_args()
+# -----------------------------
+# Training loop (called by main)
+# -----------------------------
+def run_encoder_training(
+    *,
+    seed: int,
+    version: int,
+    model_name: str,
+    num_epochs: int,
+    grad_accum: int,
+    early_stop_patience: int,
+    max_length: int,
+    batch_size: int,
+    learning_rate: float,
+    log_every_n_steps: int,
+    save_dir: str,
+    accelerator: str = "auto",
+    devices: Union[str, int] = "auto",
+    precision: str = "32-true",
+    eval_only: bool = False,
+    run_name: Optional[str] = None,
+):
+    L.seed_everything(seed, workers=True)
 
-    cfg = Config()
+    spec = get_encoder_spec(version)
 
-    # ------------------------------------------------------------------
-    # IMPORTANT:
-    # You must provide these in your environment/script before running:
-    #   dataset (pandas df with columns: condition, record_type)
-    #   dataset_train / dataset_val / dataset_test (lists of dicts)
-    # Each dict must have: text, condition, record_type
-    # ------------------------------------------------------------------
-    global dataset, dataset_train, dataset_val, dataset_test
-
-    if args.version == 1:
-        saved_model_name = "saved_encoder_model_v1"
-        datamodule = EncoderDataModuleV1(cfg, dataset, dataset_train, dataset_val, dataset_test)
-        lit_model = EncoderLightningModuleV1(cfg)
-        monitor_metric = "val/loss"
-        eval_fn = evaluate_best_v1
-    else:
-        saved_model_name = "saved_encoder_model_v2"
-        datamodule = EncoderDataModuleV2(cfg, dataset, dataset_train, dataset_val, dataset_test)
-        lit_model = EncoderLightningModuleV2(cfg)
-        monitor_metric = "val/loss"
-        eval_fn = evaluate_best_v2
-
-    run_name = args.run_name or saved_model_name
-    ckpt_dir = os.path.join(args.save_dir, run_name)
+    run_name = spec.saved_model_name
+    ckpt_dir = os.path.join(save_dir, run_name)
     os.makedirs(ckpt_dir, exist_ok=True)
 
+    # ---- DataModule / Model ----
+    dm = spec.datamodule_cls(cfg, dataset, dataset_train, dataset_val, dataset_test)
+    lit_model = spec.lit_model_cls(cfg)
+
+    # ---- Logger ----
+    tb_logger = TensorBoardLogger(
+        save_dir=os.path.join(args.save_dir, "tb_logs"),
+        name=run_name,
+    )
+
+    # ---- Checkpointing / Early stopping ----
     checkpoint_cb = ModelCheckpoint(
         dirpath=ckpt_dir,
         filename="best",
         save_top_k=1,
-        monitor=monitor_metric,
-        mode="min",
+        monitor=spec.monitor_metric,
+        mode=spec.monitor_mode,
         save_last=True,
     )
-    earlystop_cb = EarlyStopping(monitor=monitor_metric, mode="min", patience=cfg.early_stop_patience)
+    earlystop_cb = EarlyStopping(
+        monitor=spec.monitor_metric,
+        mode=spec.monitor_mode,
+        patience=cfg.early_stop_patience,
+    )
 
-    logger = TensorBoardLogger(save_dir=os.path.join(args.save_dir, "tb_logs"), name=run_name)
-
-    trainer = pl.Trainer(
+    # ---- Trainer ----
+    trainer = L.Trainer(
         max_epochs=cfg.num_epochs,
         accumulate_grad_batches=cfg.grad_accum,
         callbacks=[checkpoint_cb, earlystop_cb],
-        logger=logger,
+        logger=tb_logger,
         accelerator="auto",
         devices="auto",
-        log_every_n_steps=10,
+        log_every_n_steps=log_every_n_steps,
+        default_root_dir=ckpt_dir,
     )
 
-    datamodule.setup()
+    dm.setup()
 
-    if not args.eval_only:
-        trainer.fit(lit_model, datamodule=datamodule)
+    if not eval_only:
+        trainer.fit(lit_model, datamodule=dm)
 
-    best_ckpt_path = checkpoint_cb.best_model_path
-    if not best_ckpt_path:
-        # If eval_only and callback didn't run, try to find best.ckpt
-        candidate = os.path.join(ckpt_dir, "best.ckpt")
-        if os.path.exists(candidate):
-            best_ckpt_path = candidate
-
-    if not best_ckpt_path or not os.path.exists(best_ckpt_path):
-        raise FileNotFoundError(f"Could not find best checkpoint in {ckpt_dir}")
+    # ---- Resolve best checkpoint, save tokenizer, eval ----
+    best_ckpt_path = resolve_best_ckpt(checkpoint_cb, ckpt_dir)
 
     # Save tokenizer too (easy deployment)
-    datamodule.tokenizer.save_pretrained(ckpt_dir)
+    dm.tokenizer.save_pretrained(ckpt_dir)
 
-    # Evaluate best checkpoint on test set (simple + explicit)
-    metrics = eval_fn(best_ckpt_path, datamodule, cfg)
+    metrics = spec.eval_fn(best_ckpt_path, dm, cfg)
     print("\n=== Best checkpoint test metrics ===")
     for k, v in metrics.items():
         print(f"{k}: {v}")
 
     print(f"\nBest checkpoint: {best_ckpt_path}")
     print(f"Tokenizer saved to: {ckpt_dir}")
+
+
+# -------------------------
+# Main
+# -------------------------
+def main():
+    # -------------------------
+    # Constants (all here)
+    # -------------------------
+    SEED = 42
+
+    # Model
+    MODEL_NAME = "Qwen/Qwen3-8B"
+
+    # Tokenization / batching
+    MAX_LENGTH = 1028
+    BATCH_SIZE = 1              # per GPU
+    GRAD_ACCUM = 16                   # effective batch = BATCH_SIZE * GRAD_ACCUM
+
+    # Training
+    LR = 2e-5
+    LOG_EVERY_N_STEPS = 10
+    NUM_EPOCHS = 10
+    EARLY_STOP_PATIENCE = 3
+
+    # Precision
+    PRECISION = "bf16-mixed"  # if your GPUs support bf16; otherwise use "16-mixed"
+
+    # Output
+    SAVE_DIR = "./encoder_finetuning"
+
+    # Version: 
+    # 1: Encoder backbone with classification heads
+    # 2: Encoder with masked token prediction-style classification
+    VERSION = 1
+
+    wandb_key = os.getenv("WANDB_KEY")
+    if wandb_key:
+        # Authenticate using the key
+        login(key=wandb_key)
+        print("Successfully logged into wandb.")
+    else:
+        print("Error: WANDB_API_KEY environment variable not found.")
+
+    run_encoder_training(
+        seed=SEED,
+        version=VERSION,
+        model_name=MODEL_NAME,
+        num_epochs=NUM_EPOCHS,
+        grad_accum=GRAD_ACCUM,
+        early_stop_patience=EARLY_STOP_PATIENCE,
+        max_length=MAX_LENGTH,
+        batch_size=BATCH_SIZE,
+        learning_rate=LR,
+        log_every_n_steps=LOG_EVERY_N_STEPS,
+        save_dir=SAVE_DIR,
+        accelerator="auto",
+        devices="auto",
+        precision=PRECISION,
+        eval_only=False,  # True to skip training and only eval best ckpt
+        run_name=None,  # or "my_run_name"
+    )
+
+
+
+    
 
 
 if __name__ == "__main__":

@@ -119,17 +119,21 @@ class SlimOrcaDataModule(L.LightningDataModule):
 
         if self.train_split not in ds:
             raise ValueError(f"Split '{self.train_split}' not in dataset splits: {list(ds.keys())}")
+        
 
+        print("Filtering out problematic samples for training", flush=True)
         train_full = self._prep_and_filter(ds[self.train_split])
 
         # If val split exists, filter it too; otherwise create val/test from filtered train_full.
         if self.val_split in ds:
+            print("Filtering out problematic samples for validation", flush=True)
             val = self._prep_and_filter(ds[self.val_split])
 
             # Create test split same size as val (from dataset test split if exists, else from train_full).
             val_n = len(val)
 
             if "test" in ds:
+                print("Filtering out problematic samples for testing", flush=True)
                 test_full = self._prep_and_filter(ds["test"])
                 test_n = min(val_n, len(test_full))
                 test = test_full.shuffle(seed=self.seed).select(range(test_n))
@@ -152,6 +156,7 @@ class SlimOrcaDataModule(L.LightningDataModule):
             test = shuffled.select(range(val_n, val_n + test_n))
             train = shuffled.select(range(val_n + test_n, len(shuffled)))
 
+        print("Datasets are ready", flush=True)
         self.train_ds = train
         self.val_ds = val
         self.test_ds = test
@@ -353,6 +358,16 @@ class SFTLoRAModule(L.LightningModule):
         loss = out.loss
         self.log("val/loss", loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=batch.input_ids.size(0), sync_dist=True)
         return loss
+    
+    def test_step(self, batch: Batch, batch_idx: int):
+        out = self(
+            input_ids=batch.input_ids,
+            attention_mask=batch.attention_mask,
+            labels=batch.labels,
+        )
+        loss = out.loss
+        self.log("test/loss", loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=batch.input_ids.size(0), sync_dist=True)
+        return loss
 
     def configure_optimizers(self):
         # AdamW
@@ -471,9 +486,13 @@ def run_training(
         logger=wandb_logger,
         callbacks=[checkpoint_callback],
         default_root_dir=save_dir,
+        deterministic=True
     )
 
+    trainer.validate(lit_model, datamodule=dm)
+    trainer.test(lit_model, datamodule=dm)
     trainer.fit(lit_model, datamodule=dm)
+    trainer.test(model=lit_model, datamodule=dm)
 
 
 # -----------------------------
@@ -502,7 +521,7 @@ def main():
     NUM_WORKERS = 4
 
     # Training
-    LR = 2e-4
+    LR = 1e-6
     WEIGHT_DECAY = 0.0
     WARMUP_STEPS = 200
     MAX_STEPS = 5000
