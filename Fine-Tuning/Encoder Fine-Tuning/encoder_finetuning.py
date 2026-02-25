@@ -110,6 +110,7 @@ class EncoderDataModuleV1(L.LightningDataModule):
         self,
         dataset_name: str,
         tokenizer_name: str,
+        test_and_val_size: float,
         max_length: int,
         batch_size: int,
         num_workers: int,
@@ -118,6 +119,7 @@ class EncoderDataModuleV1(L.LightningDataModule):
         super().__init__()
         self.dataset_name = dataset_name
         self.tokenizer_name = tokenizer_name
+        self.test_and_val_size = test_and_val_size
         self.max_length = max_length
         self.batch_size = batch_size
         self.num_workers = num_workers
@@ -125,17 +127,20 @@ class EncoderDataModuleV1(L.LightningDataModule):
 
     def prepare_data(self):
         # Load dataset and tokenizer
-        load_dataset(self.dataset_name, split=self.train_split)
+        load_dataset(self.dataset_name)
         AutoTokenizer.from_pretrained(self.tokenizer_name)
 
-    # Continue from here
     def setup(self, stage: Optional[str] = None):
 
         self.tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name)
         self.dataset = load_dataset(self.dataset_name)
-        self.train = self.dataset["train"]
-        self.val = self.dataset["validation"]
-        self.test = self.dataset["test"]
+        
+        train_val_split = self.dataset["train"].train_test_split(test_size=self.test_and_val_size, seed=self.seed)
+        train = train_val_split["train"]
+        
+        val_test_split = train_val_split["test"].train_test_split(test_size=0.5, seed=self.seed)
+        val = val_test_split["train"]
+        test = val_test_split["test"]
 
         # label maps
         self.condition_map = {label: i for i, label in enumerate(pd.unique(self.train["condition"]))}
@@ -143,17 +148,23 @@ class EncoderDataModuleV1(L.LightningDataModule):
         self.record_type_map = {label: i for i, label in enumerate(pd.unique(self.train["record_type"]))}
         self.reverse_record_type_map = {v: k for k, v in self.record_type_map.items()}
 
-        train = Dataset.from_list(self.dataset_train_raw).map(
+
+        train = train.map(
             self.tokenize_function,
             batched=False,
             remove_columns=["text", "condition", "record_type"],
         )
-        val = Dataset.from_list(self.dataset_val_raw).map(
+        val = val.map(
             self.tokenize_function,
             batched=False,
             remove_columns=["text", "condition", "record_type"],
         )
-        test = Dataset.from_list(self.dataset_test_raw)  # keep raw for inference later
+        test = test.map(
+            self.tokenize_function,
+            batched=False,
+            remove_columns=["text", "condition", "record_type"],
+        )
+        self.test = test  # keep raw for inference later
         self.train_ds = train
         self.val_ds = val
         self.test_ds = test
@@ -162,7 +173,7 @@ class EncoderDataModuleV1(L.LightningDataModule):
         inputs = self.tokenizer(
             f"Choose the condition and the record type of the following medical note: {example['text']}",
             truncation=True,
-            max_length=self.cfg.max_length,
+            max_length=self.max_length,
         )
         inputs["label1"] = self.condition_map[example["condition"]]
         inputs["label2"] = self.record_type_map[example["record_type"]]
@@ -192,19 +203,19 @@ class EncoderDataModuleV1(L.LightningDataModule):
     def train_dataloader(self):
         return DataLoader(
             self.train_ds,
-            batch_size=self.cfg.batch_size,
+            batch_size=self.batch_size,
             shuffle=True,
             collate_fn=self.collate_fn,
-            num_workers=self.cfg.num_workers,
+            num_workers=self.num_workers,
         )
 
     def val_dataloader(self):
         return DataLoader(
             self.val_ds,
-            batch_size=self.cfg.batch_size,
+            batch_size=self.batch_size,
             shuffle=False,
             collate_fn=self.collate_fn,
-            num_workers=self.cfg.num_workers,
+            num_workers=self.num_workers,
         )
 
 
@@ -214,31 +225,73 @@ class EncoderDataModuleV2(L.LightningDataModule):
     """
     def __init__(
         self,
-        cfg: Config,
-        dataset_df: pd.DataFrame,
-        dataset_train: List[Dict[str, Any]],
-        dataset_val: List[Dict[str, Any]],
-        dataset_test: List[Dict[str, Any]],
+        dataset_name: str,
+        tokenizer_name: str,
+        test_and_val_size: float,
+        max_length: int,
+        batch_size: int,
+        num_workers: int,
+        seed: int,
     ):
         super().__init__()
-        self.cfg = cfg
-        self.dataset_df = dataset_df
-        self.dataset_train_raw = dataset_train
-        self.dataset_val_raw = dataset_val
-        self.dataset_test_raw = dataset_test
-
-        self.tokenizer = AutoTokenizer.from_pretrained(cfg.model_name)
-
-        self.condition_map = {label: i for i, label in enumerate(pd.unique(dataset_df["condition"]))}
-        self.reverse_condition_map = {v: k for k, v in self.condition_map.items()}
-        self.record_type_map = {label: i for i, label in enumerate(pd.unique(dataset_df["record_type"]))}
-        self.reverse_record_type_map = {v: k for k, v in self.record_type_map.items()}
-
-        self.max_tokens = self._compute_max_tokens()
+        self.dataset_name = dataset_name
+        self.tokenizer_name = tokenizer_name
+        self.test_and_val_size = test_and_val_size
+        self.max_length = max_length
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.seed = seed
 
         self.train_ds = None
         self.val_ds = None
         self.test_ds = None
+
+    def prepare_data(self):
+        # Load dataset and tokenizer
+        load_dataset(self.dataset_name, split=self.train_split)
+        AutoTokenizer.from_pretrained(self.tokenizer_name)
+
+    def setup(self, stage: Optional[str] = None):
+
+        self.tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name)
+        self.dataset = load_dataset(self.dataset_name)
+        
+        train_val_split = self.dataset["train"].train_test_split(test_size=self.test_and_val_size, seed=self.seed)
+        train = train_val_split["train"]
+        
+        val_test_split = train_val_split["test"].train_test_split(test_size=0.5, seed=self.seed)
+        val = val_test_split["train"]
+        test = val_test_split["test"]
+
+        # label maps
+        self.condition_map = {label: i for i, label in enumerate(pd.unique(train["condition"]))}
+        self.reverse_condition_map = {v: k for k, v in self.condition_map.items()}
+        self.record_type_map = {label: i for i, label in enumerate(pd.unique(train["record_type"]))}
+        self.reverse_record_type_map = {v: k for k, v in self.record_type_map.items()}
+
+        self.max_tokens = self._compute_max_tokens()
+
+        train = train.map(
+            self.tokenize_function,
+            batched=False,
+            remove_columns=["text", "condition", "record_type"],
+        )
+        val = val.map(
+            self.tokenize_function,
+            batched=False,
+            remove_columns=["text", "condition", "record_type"],
+        )
+        test = test.map(
+            self.tokenize_function,
+            batched=False,
+            remove_columns=["text", "condition", "record_type"],
+        )
+
+        self.test = test  # keep raw for inference later
+        self.train_ds = train
+        self.val_ds = val
+        self.test_ds = test
+
 
     def _compute_max_tokens(self) -> int:
         max_tokens = 0
@@ -257,24 +310,36 @@ class EncoderDataModuleV2(L.LightningDataModule):
             f" The record type is: {' '.join([self.tokenizer.mask_token] * self.max_tokens)}"
         )
 
-        inputs = self.tokenizer(prompt, truncation=True, max_length=self.cfg.max_length)
+        inputs = self.tokenizer(prompt, truncation=True, max_length=self.max_length)
 
-        # Create labels: -100 for non-mask positions, and token IDs for mask positions
-        input_ids = inputs["input_ids"]
-        labels = [-100] * len(input_ids)
-
-        mask_id = self.tokenizer.mask_token_id
-        mask_positions = [i for i, tid in enumerate(input_ids) if tid == mask_id]
-
-        # First max_tokens masks -> condition, next max_tokens -> record_type
-        for j, pos in enumerate(mask_positions):
-            if j < self.max_tokens:
-                labels[pos] = condition_tokens[j] if j < len(condition_tokens) else self.tokenizer.pad_token_id
+        token_ids = self.tokenizer.convert_ids_to_tokens(inputs["input_ids"])
+        labels = [token if token == self.tokenizer.mask_token else -100 for token in token_ids]
+        
+        # Replace first set of [MASK] tokens with correct labels
+        condition_done = False
+        start_span = False
+        start_span_idx = 0
+        for i in range(len(labels)):
+            if labels[i] == self.tokenizer.mask_token:
+                if not start_span:
+                    start_span = True
+                    start_span_idx = i
             else:
-                k = j - self.max_tokens
-                labels[pos] = record_type_tokens[k] if k < len(record_type_tokens) else self.tokenizer.pad_token_id
+                if start_span:
+                    condition_done=True
+                    start_span = False
 
+            if start_span:
+                if not condition_done:
+                    labels[i] = condition_tokens[i - start_span_idx] if i-start_span_idx < len(condition_tokens) else self.tokenizer.pad_token_id
+                else:
+                    labels[i] = record_type_tokens[i - start_span_idx] if i-start_span_idx < len(record_type_tokens) else self.tokenizer.pad_token_id
+
+        # Squeeze the tensors to (seq_len), since the tokenizer puts outputs the shape (1, seq_len)
+        inputs["input_ids"] = inputs["input_ids"]
+        inputs["attention_mask"] = inputs["attention_mask"]
         inputs["labels"] = labels
+
         return inputs
 
     def collate_fn(self, batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
@@ -299,38 +364,31 @@ class EncoderDataModuleV2(L.LightningDataModule):
             "labels": labels,
         }
 
-    def setup(self, stage: Optional[str] = None):
-        train = Dataset.from_list(self.dataset_train_raw).map(
-            self.tokenize_function,
-            batched=False,
-            remove_columns=["text", "condition", "record_type"],
-        )
-        val = Dataset.from_list(self.dataset_val_raw).map(
-            self.tokenize_function,
-            batched=False,
-            remove_columns=["text", "condition", "record_type"],
-        )
-        test = Dataset.from_list(self.dataset_test_raw)  # keep raw for inference later
-        self.train_ds = train
-        self.val_ds = val
-        self.test_ds = test
-
     def train_dataloader(self):
         return DataLoader(
             self.train_ds,
-            batch_size=self.cfg.batch_size,
+            batch_size=self.batch_size,
             shuffle=True,
             collate_fn=self.collate_fn,
-            num_workers=self.cfg.num_workers,
+            num_workers=self.num_workers,
         )
 
     def val_dataloader(self):
         return DataLoader(
             self.val_ds,
-            batch_size=self.cfg.batch_size,
+            batch_size=self.batch_size,
             shuffle=False,
             collate_fn=self.collate_fn,
-            num_workers=self.cfg.num_workers,
+            num_workers=self.num_workers,
+        )
+    
+    def test_dataloader(self):
+        return DataLoader(
+            self.test_ds,
+            batch_size=self.batch_size,
+            shuffle=False,
+            collate_fn=self.collate_fn,
+            num_workers=self.num_workers,
         )
 
 
@@ -338,12 +396,15 @@ class EncoderDataModuleV2(L.LightningDataModule):
 # LightningModules
 # -------------------------
 class EncoderLightningModuleV1(L.LightningModule):
-    def __init__(self, cfg: Config):
+    def __init__(self, model_name: str, lr: float = 1e-5, num_labels1: int = 5, num_labels2: int = 2):
         super().__init__()
-        self.cfg = cfg
+        self.model_name = model_name
+        self.lr = lr
+        self.num_labels1 = num_labels1
+        self.num_labels2 = num_labels2
         self.save_hyperparameters()
 
-        self.model = EncoderWithTwoHeads(cfg.model_name, cfg.num_labels1, cfg.num_labels2)
+        self.model = EncoderWithTwoHeads(model_name, num_labels1, num_labels2)
         self.loss_fn1 = torch.nn.CrossEntropyLoss()
         self.loss_fn2 = torch.nn.CrossEntropyLoss()
 
@@ -408,15 +469,16 @@ class EncoderLightningModuleV1(L.LightningModule):
             self.log("val/acc_record_type", acc_2, prog_bar=True)
 
     def configure_optimizers(self):
-        return AdamW(self.parameters(), lr=self.cfg.lr)
+        return AdamW(self.parameters(), lr=self.lr)
 
 
 class EncoderLightningModuleV2(L.LightningModule):
-    def __init__(self, cfg: Config):
+    def __init__(self, model_name: str, lr: float = 1e-5):
         super().__init__()
-        self.cfg = cfg
+        self.model_name = model_name
+        self.lr = lr
         self.save_hyperparameters()
-        self.model = AutoModelForMaskedLM.from_pretrained(cfg.model_name)
+        self.model = AutoModelForMaskedLM.from_pretrained(model_name)
 
     def forward(self, **batch):
         return self.model(**batch)
@@ -434,7 +496,7 @@ class EncoderLightningModuleV2(L.LightningModule):
         return loss
 
     def configure_optimizers(self):
-        return AdamW(self.parameters(), lr=self.cfg.lr)
+        return AdamW(self.parameters(), lr=self.lr)
 
 
 # -------------------------
@@ -444,10 +506,9 @@ class EncoderLightningModuleV2(L.LightningModule):
 def evaluate_best_v1(
     ckpt_path: str,
     datamodule: EncoderDataModuleV1,
-    cfg: Config,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> Dict[str, float]:
-    model = EncoderLightningModuleV1.load_from_checkpoint(ckpt_path, cfg=cfg)
+    model = EncoderLightningModuleV1.load_from_checkpoint(ckpt_path, model_name=datamodule.model_name, num_labels1=datamodule.num_labels1, num_labels2=datamodule.num_labels2)
     model.to(device)
     model.eval()
 
@@ -464,7 +525,7 @@ def evaluate_best_v1(
             f"Choose the condition and the record type of the following medical note: {ex['text']}",
             return_tensors="pt",
             truncation=True,
-            max_length=cfg.max_length,
+            max_length=datamodule.max_length,
         ).to(device)
 
         logits1, logits2 = model.model(**inputs)
@@ -494,10 +555,9 @@ def evaluate_best_v1(
 def evaluate_best_v2(
     ckpt_path: str,
     datamodule: EncoderDataModuleV2,
-    cfg: Config,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> Dict[str, float]:
-    model = EncoderLightningModuleV2.load_from_checkpoint(ckpt_path, cfg=cfg)
+    model = EncoderLightningModuleV2.load_from_checkpoint(ckpt_path, model_name=datamodule.model_name, lr=datamodule.lr)
     model.to(device)
     model.eval()
 
@@ -513,7 +573,7 @@ def evaluate_best_v2(
             f" The condition is: {' '.join([tokenizer.mask_token] * max_tokens)};"
             f" The record type is: {' '.join([tokenizer.mask_token] * max_tokens)}"
         )
-        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=cfg.max_length).to(device)
+        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=datamodule.max_length).to(device)
         outputs = model.model(**inputs)
         logits = outputs.logits  # [1, T, V]
 
@@ -582,12 +642,28 @@ def run_encoder_training(
     os.makedirs(ckpt_dir, exist_ok=True)
 
     # ---- DataModule / Model ----
-    dm = spec.datamodule_cls(cfg, dataset, dataset_train, dataset_val, dataset_test)
-    lit_model = spec.lit_model_cls(cfg)
+    dm = spec.datamodule_cls(
+        dataset_name="karenwky/pet-health-symptoms-dataset",
+        tokenizer_name=model_name,
+        test_and_val_size=0.2,
+        max_length=max_length,
+        batch_size=batch_size,
+        num_workers=4,
+        seed=seed,
+    )
+    lit_model = spec.lit_model_cls(model_name=model_name, lr=learning_rate)
+
 
     # ---- Logger ----
-    tb_logger = TensorBoardLogger(
-        save_dir=os.path.join(args.save_dir, "tb_logs"),
+    wandb_key = os.getenv("WANDB_KEY")
+    if wandb_key:
+        # Authenticate using the key
+        login(key=wandb_key)
+        print("Successfully logged into wandb.")
+    else:
+        print("Error: WANDB_API_KEY environment variable not found.")
+    logger = WandbLogger(
+        project="oceanprotocol",
         name=run_name,
     )
 
@@ -603,15 +679,18 @@ def run_encoder_training(
     earlystop_cb = EarlyStopping(
         monitor=spec.monitor_metric,
         mode=spec.monitor_mode,
-        patience=cfg.early_stop_patience,
+        patience=early_stop_patience,
     )
 
     # ---- Trainer ----
     trainer = L.Trainer(
-        max_epochs=cfg.num_epochs,
-        accumulate_grad_batches=cfg.grad_accum,
+        accelerator=accelerator,
+        devices=devices,
+        precision=precision,
+        max_epochs=num_epochs,
+        accumulate_grad_batches=grad_accum,
         callbacks=[checkpoint_cb, earlystop_cb],
-        logger=tb_logger,
+        logger=logger,
         accelerator="auto",
         devices="auto",
         log_every_n_steps=log_every_n_steps,
@@ -629,7 +708,7 @@ def run_encoder_training(
     # Save tokenizer too (easy deployment)
     dm.tokenizer.save_pretrained(ckpt_dir)
 
-    metrics = spec.eval_fn(best_ckpt_path, dm, cfg)
+    metrics = spec.eval_fn(best_ckpt_path, dm)
     print("\n=== Best checkpoint test metrics ===")
     for k, v in metrics.items():
         print(f"{k}: {v}")
@@ -698,10 +777,6 @@ def main():
         eval_only=False,  # True to skip training and only eval best ckpt
         run_name=None,  # or "my_run_name"
     )
-
-
-
-    
 
 
 if __name__ == "__main__":

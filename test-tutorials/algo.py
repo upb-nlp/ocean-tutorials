@@ -272,6 +272,17 @@ class SlimOrcaDataModule(L.LightningDataModule):
             collate_fn=self._collate,
             drop_last=False,
         )
+    
+    def test_dataloader(self) -> DataLoader:
+        return DataLoader(
+            self.test_ds,
+            batch_size=self.micro_batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=True,
+            collate_fn=self._collate,
+            drop_last=False,
+        )
 
 
 # -----------------------------
