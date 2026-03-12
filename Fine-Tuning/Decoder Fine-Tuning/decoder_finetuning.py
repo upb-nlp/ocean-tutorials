@@ -2,6 +2,7 @@ import os
 import math
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
+from lightning.pytorch.callbacks import TQDMProgressBar
 
 import torch
 from torch.utils.data import DataLoader
@@ -67,8 +68,7 @@ class SlimOrcaDataModule(L.LightningDataModule):
         self.enable_thinking = enable_thinking
 
         self.tokenizer = None
-        self.train_ds = None
-        self.val_ds = None
+        self._setup_done = False
 
     def prepare_data(self):
         # Runs only on global rank 0
@@ -103,58 +103,65 @@ class SlimOrcaDataModule(L.LightningDataModule):
         return split_ds.remove_columns(["is_good"])
 
     def setup(self, stage: Optional[str] = None):
-        # Tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            self.tokenizer_name,
-            padding_side="left",
-            use_fast=True,
-            trust_remote_code=True,
-        )
-        # Make sure we have a pad token (Qwen tokenizers typically do, but be safe)
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
+        if not self._setup_done:
+            # Tokenizer
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.tokenizer_name,
+                padding_side="left",
+                use_fast=True,
+                trust_remote_code=True,
+            )
+            # Make sure we have a pad token (Qwen tokenizers typically do, but be safe)
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        # Dataset
-        ds = load_dataset(self.dataset_name)
+            # Dataset
+            ds = load_dataset(self.dataset_name)
 
-        if self.train_split not in ds:
-            raise ValueError(f"Split '{self.train_split}' not in dataset splits: {list(ds.keys())}")
+            if self.train_split not in ds:
+                raise ValueError(f"Split '{self.train_split}' not in dataset splits: {list(ds.keys())}")
+            
 
-        train_full = self._prep_and_filter(ds[self.train_split])
+            print("Filtering out problematic samples for training", flush=True)
+            train_full = self._prep_and_filter(ds[self.train_split])
 
-        # If val split exists, filter it too; otherwise create val/test from filtered train_full.
-        if self.val_split in ds:
-            val = self._prep_and_filter(ds[self.val_split])
+            # If val split exists, filter it too; otherwise create val/test from filtered train_full.
+            if self.val_split in ds:
+                print("Filtering out problematic samples for validation", flush=True)
+                val = self._prep_and_filter(ds[self.val_split])
 
-            # Create test split same size as val (from dataset test split if exists, else from train_full).
-            val_n = len(val)
+                # Create test split same size as val (from dataset test split if exists, else from train_full).
+                val_n = len(val)
 
-            if "test" in ds:
-                test_full = self._prep_and_filter(ds["test"])
-                test_n = min(val_n, len(test_full))
-                test = test_full.shuffle(seed=self.seed).select(range(test_n))
+                if "test" in ds:
+                    print("Filtering out problematic samples for testing", flush=True)
+                    test_full = self._prep_and_filter(ds["test"])
+                    test_n = min(val_n, len(test_full))
+                    test = test_full.shuffle(seed=self.seed).select(range(test_n))
+                else:
+                    # sample from train_full without overlap with train by taking from a shuffled view
+                    shuffled = train_full.shuffle(seed=self.seed)
+                    test_n = min(val_n, len(shuffled))
+                    test = shuffled.select(range(test_n))
+
+                train = train_full
+
             else:
-                # sample from train_full without overlap with train by taking from a shuffled view
+                # deterministic split: val then test then train
                 shuffled = train_full.shuffle(seed=self.seed)
-                test_n = min(val_n, len(shuffled))
-                test = shuffled.select(range(test_n))
 
-            train = train_full
+                val_n = min(self.val_size, len(shuffled))
+                test_n = min(val_n, max(0, len(shuffled) - val_n))  # same size as val if possible
 
-        else:
-            # deterministic split: val then test then train
-            shuffled = train_full.shuffle(seed=self.seed)
+                val = shuffled.select(range(val_n))
+                test = shuffled.select(range(val_n, val_n + test_n))
+                train = shuffled.select(range(val_n + test_n, len(shuffled)))
 
-            val_n = min(self.val_size, len(shuffled))
-            test_n = min(val_n, max(0, len(shuffled) - val_n))  # same size as val if possible
-
-            val = shuffled.select(range(val_n))
-            test = shuffled.select(range(val_n, val_n + test_n))
-            train = shuffled.select(range(val_n + test_n, len(shuffled)))
-
-        self.train_ds = train
-        self.val_ds = val
-        self.test_ds = test
+            print("Datasets are ready", flush=True)
+            self.train_ds = train
+            self.val_ds = val
+            self.test_ds = test
+            self._setup_done = True
 
     def _extract_messages(self, example: Dict[str, Any]) -> List[Dict[str, str]]:
         """
@@ -267,6 +274,17 @@ class SlimOrcaDataModule(L.LightningDataModule):
             collate_fn=self._collate,
             drop_last=False,
         )
+    
+    def test_dataloader(self) -> DataLoader:
+        return DataLoader(
+            self.test_ds,
+            batch_size=self.micro_batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=True,
+            collate_fn=self._collate,
+            drop_last=False,
+        )
 
 
 # -----------------------------
@@ -313,6 +331,11 @@ class SFTLoRAModule(L.LightningModule):
         )
         self.model = get_peft_model(self.model, peft_config)
 
+        self.max_steps = max_steps
+        self.lr = lr
+        self.weight_decay = weight_decay
+        self.warmup_steps = warmup_steps
+        self.grad_clip = grad_clip
         # Helpful: prints trainable params on rank 0 only
         self._log_trainable_params()
 
@@ -341,7 +364,14 @@ class SFTLoRAModule(L.LightningModule):
             labels=batch.labels,
         )
         loss = out.loss
-        self.log("train/loss", loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=batch.input_ids.size(0), sync_dist=True)
+        self.log("train/loss", loss, prog_bar=True, on_step=True, on_epoch=False, batch_size=batch.input_ids.size(0), sync_dist=True)
+
+        # if self.trainer.is_global_zero:
+        #     print(
+        #         f"optimizer_step={self.global_step}/{self.trainer.max_steps}",
+        #         flush=True
+        #     )
+
         return loss
 
     def validation_step(self, batch: Batch, batch_idx: int):
@@ -353,13 +383,23 @@ class SFTLoRAModule(L.LightningModule):
         loss = out.loss
         self.log("val/loss", loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=batch.input_ids.size(0), sync_dist=True)
         return loss
+    
+    def test_step(self, batch: Batch, batch_idx: int):
+        out = self(
+            input_ids=batch.input_ids,
+            attention_mask=batch.attention_mask,
+            labels=batch.labels,
+        )
+        loss = out.loss
+        self.log("test/loss", loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=batch.input_ids.size(0), sync_dist=True)
+        return loss
 
     def configure_optimizers(self):
         # AdamW
         optimizer = AdamW8bit(
             self.parameters(),
-            lr=self.hparams.lr,
-            weight_decay=self.hparams.weight_decay,
+            lr=self.lr,
+            weight_decay=self.weight_decay,
             betas=(0.9, 0.95),
             eps=1e-8,
         )
@@ -367,8 +407,8 @@ class SFTLoRAModule(L.LightningModule):
         # Linear warmup then linear decay
         scheduler = get_linear_schedule_with_warmup(
             optimizer,
-            num_warmup_steps=self.hparams.warmup_steps,
-            num_training_steps=self.hparams.max_steps,
+            num_warmup_steps=self.warmup_steps,
+            num_training_steps=self.max_steps,
         )
 
         return {
@@ -379,6 +419,22 @@ class SFTLoRAModule(L.LightningModule):
                 "frequency": 1,
             },
         }
+    
+class OptimStepProgressBar(TQDMProgressBar):
+    def init_train_tqdm(self):
+        bar = super().init_train_tqdm()
+        if self.trainer.max_steps and self.trainer.max_steps > 0:
+            bar.total = self.trainer.max_steps
+        return bar
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        # Show optimizer-step progress, not batch progress
+        if self.train_progress_bar is not None:
+            self.train_progress_bar.n = trainer.global_step
+            self.train_progress_bar.set_postfix({
+                "step": f"{trainer.global_step}/{trainer.max_steps}"
+            })
+            self.train_progress_bar.refresh()
 
 # -----------------------------
 # Training loop (called by main)
@@ -454,7 +510,7 @@ def run_training(
         mode="min",
         save_top_k=1,
         save_last=True,
-        every_n_train_steps=val_check_interval,
+        verbose=True,
     )
 
     trainer = L.Trainer(
@@ -469,11 +525,23 @@ def run_training(
         gradient_clip_val=1.0,
         gradient_clip_algorithm="norm",
         logger=wandb_logger,
-        callbacks=[checkpoint_callback],
+        callbacks=[checkpoint_callback, OptimStepProgressBar()],
         default_root_dir=save_dir,
+        deterministic=True
     )
 
+    from pathlib import Path
+    path = Path("/data/outputs/my_folder/test.txt") 
+    path.parent.mkdir(parents=True, exist_ok=True) 
+    with path.open("w", encoding="utf-8") as f: 
+        f.write("test works")
+
+    print("Starting Initial Validation!", flush=True)
+    trainer.validate(lit_model, datamodule=dm)
+    print("Starting Training!", flush=True)
     trainer.fit(lit_model, datamodule=dm)
+    print("Starting Final Testing!", flush=True)
+    trainer.test(model=lit_model, datamodule=dm)
 
 
 # -----------------------------
@@ -502,11 +570,11 @@ def main():
     NUM_WORKERS = 4
 
     # Training
-    LR = 2e-4
+    LR = 1e-6
     WEIGHT_DECAY = 0.0
     WARMUP_STEPS = 200
-    MAX_STEPS = 5000
-    LOG_EVERY_N_STEPS = 10
+    MAX_STEPS = 1000
+    LOG_EVERY_N_STEPS = 1
     VAL_CHECK_INTERVAL = 500
 
     # Multi-GPU
@@ -517,7 +585,7 @@ def main():
     PRECISION = "bf16-mixed"  # if your GPUs support bf16; otherwise use "16-mixed"
 
     # Output
-    SAVE_DIR = "./qwen3_8b_slimorca_lora_adapter"
+    SAVE_DIR = "/data/outputs/qwen3_8b_slimorca_lora_adapter"
 
     # LoRA config
     LORA_R = 16
