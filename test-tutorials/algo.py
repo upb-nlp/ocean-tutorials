@@ -1,28 +1,29 @@
 import os
-import math
+import argparse
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
-from lightning.pytorch.callbacks import TQDMProgressBar
+from typing import Any, Dict, List, Optional, Tuple, Type, Callable, Union
 
+import numpy as np
+import pandas as pd
 import torch
+
+from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader
+from torch.optim import AdamW
 
 import lightning as L
-from lightning.pytorch.utilities.rank_zero import rank_zero_only
-
-from datasets import load_dataset
+from lightning.pytorch.loggers import WandbLogger
+from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping
 
 from transformers import (
-    AutoModelForCausalLM,
     AutoTokenizer,
-    get_linear_schedule_with_warmup,
+    AutoModel,
+    AutoModelForMaskedLM,
 )
 
-from peft import LoraConfig, get_peft_model
-from bitsandbytes.optim import AdamW8bit
 
-from lightning.pytorch.loggers import WandbLogger
-from lightning.pytorch.callbacks import ModelCheckpoint
+from datasets import Dataset, load_dataset
+from sklearn.metrics import f1_score, accuracy_score
 from wandb import login
 
 
@@ -35,574 +36,719 @@ class Batch:
     attention_mask: torch.Tensor
     labels: torch.Tensor
 
+@dataclass(frozen=True)
+class EncoderSpec:
+    saved_model_name: str
+    datamodule_cls: Type[Any]
+    lit_model_cls: Type[Any]
+    eval_fn: Callable[..., Dict[str, float]]
+    monitor_metric: str = "val/loss"
+    monitor_mode: str = "min"
 
-class SlimOrcaDataModule(L.LightningDataModule):
-    """
-    Loads Open-Orca/SlimOrca-Dedup (ShareGPT-style `conversations`) and prepares
-    batches for SFT on the *last assistant turn*.
-    """
 
+def get_encoder_spec(version: int) -> EncoderSpec:
+    specs: Dict[int, EncoderSpec] = {
+        1: EncoderSpec(
+            saved_model_name="saved_encoder_model_v1",
+            datamodule_cls=EncoderDataModuleV1,
+            lit_model_cls=EncoderLightningModuleV1,
+            eval_fn=evaluate_best_v1,
+        ),
+        2: EncoderSpec(
+            saved_model_name="saved_encoder_model_v2",
+            datamodule_cls=EncoderDataModuleV2,
+            lit_model_cls=EncoderLightningModuleV2,
+            eval_fn=evaluate_best_v2,
+        ),
+    }
+    if version not in specs:
+        raise ValueError(f"Unknown VERSION={version}. Supported: {list(specs)}")
+    return specs[version]
+
+
+def resolve_best_ckpt(checkpoint_cb: ModelCheckpoint, ckpt_dir: str) -> str:
+    best = checkpoint_cb.best_model_path
+
+    # If eval_only, callback may not run — fall back to conventional names.
+    if not best:
+        for candidate in (
+            os.path.join(ckpt_dir, "best.ckpt"),
+            os.path.join(ckpt_dir, "best"),
+            os.path.join(ckpt_dir, "last.ckpt"),
+        ):
+            if os.path.exists(candidate):
+                best = candidate
+                break
+
+    if not best or not os.path.exists(best):
+        raise FileNotFoundError(f"Could not find checkpoint in {ckpt_dir}")
+    return best
+
+
+# -------------------------
+# Version 1 model (2 heads)
+# -------------------------
+class EncoderWithTwoHeads(torch.nn.Module):
+    def __init__(self, model_name: str, num_labels1: int = 5, num_labels2: int = 2):
+        super().__init__()
+        self.backbone = AutoModel.from_pretrained(model_name)
+        hidden_size = self.backbone.config.hidden_size
+        self.classifier1 = torch.nn.Linear(hidden_size, num_labels1)
+        self.classifier2 = torch.nn.Linear(hidden_size, num_labels2)
+
+    def forward(self, input_ids, attention_mask=None):
+        outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
+        mask = attention_mask.unsqueeze(-1).float()
+        pooled = (outputs.last_hidden_state * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-9)
+        logits1 = self.classifier1(pooled)
+        logits2 = self.classifier2(pooled)
+        return logits1, logits2
+
+
+# -------------------------
+# DataModules
+# -------------------------
+class EncoderDataModuleV1(L.LightningDataModule):
     def __init__(
         self,
         dataset_name: str,
         tokenizer_name: str,
-        train_split: str,
-        val_split: str,
-        val_size: int,
+        test_and_val_size: float,
         max_length: int,
-        micro_batch_size: int,
+        batch_size: int,
         num_workers: int,
         seed: int,
-        enable_thinking: bool,
     ):
         super().__init__()
         self.dataset_name = dataset_name
         self.tokenizer_name = tokenizer_name
-        self.train_split = train_split
-        self.val_split = val_split
-        self.val_size = val_size
+        self.test_and_val_size = test_and_val_size
         self.max_length = max_length
-        self.micro_batch_size = micro_batch_size
+        self.batch_size = batch_size
         self.num_workers = num_workers
         self.seed = seed
-        self.enable_thinking = enable_thinking
-
-        self.tokenizer = None
-        self._setup_done = False
 
     def prepare_data(self):
-        # Runs only on global rank 0
+        # Load dataset and tokenizer
         load_dataset(self.dataset_name)
-
-    def _mark_good(self, ex: Dict[str, Any]) -> Dict[str, Any]:
-        msgs = self._extract_messages(ex)
-        ptxt, ftxt = self._build_prompt_and_full_text(msgs)
-
-        # Matches the old: if not ptxt or not ftxt -> skip
-        if not ptxt or not ftxt:
-            return {"prompt_text": "", "full_text": "", "is_good": False}
-
-        # Matches the old "all labels masked" case, including truncation effects.
-        # We check whether (after truncation) there is at least 1 token beyond prompt.
-        full_ids = self.tokenizer(
-            ftxt, truncation=True, max_length=self.max_length, add_special_tokens=True
-        )["input_ids"]
-        prompt_ids = self.tokenizer(
-            ptxt, truncation=True, max_length=self.max_length, add_special_tokens=True
-        )["input_ids"]
-
-        # In collate we mask [:prompt_len]; if prompt_len >= full_len => nothing left to learn.
-        is_good = len(full_ids) > len(prompt_ids)
-
-        return {"prompt_text": ptxt, "full_text": ftxt, "is_good": is_good}
-    
-    def _prep_and_filter(self, split_ds):
-        split_ds = split_ds.map(self._mark_good, desc="Building prompt/full + validity")
-        split_ds = split_ds.filter(lambda ex: ex["is_good"], desc="Filtering bad examples")
-        # Keep prompt/full for collate; drop the flag
-        return split_ds.remove_columns(["is_good"])
+        AutoTokenizer.from_pretrained(self.tokenizer_name)
 
     def setup(self, stage: Optional[str] = None):
-        if not self._setup_done:
-            # Tokenizer
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                self.tokenizer_name,
-                padding_side="left",
-                use_fast=True,
-                trust_remote_code=True,
-            )
-            # Make sure we have a pad token (Qwen tokenizers typically do, but be safe)
-            if self.tokenizer.pad_token is None:
-                self.tokenizer.pad_token = self.tokenizer.eos_token
 
-            # Dataset
-            ds = load_dataset(self.dataset_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name)
+        self.dataset = load_dataset(self.dataset_name)
+        
+        train_val_split = self.dataset["train"].train_test_split(test_size=self.test_and_val_size, seed=self.seed)
+        train = train_val_split["train"]
+        
+        val_test_split = train_val_split["test"].train_test_split(test_size=0.5, seed=self.seed)
+        val = val_test_split["train"]
+        test = val_test_split["test"]
 
-            if self.train_split not in ds:
-                raise ValueError(f"Split '{self.train_split}' not in dataset splits: {list(ds.keys())}")
-            
+        # label maps
+        self.condition_map = {label: i for i, label in enumerate(set(train["condition"]))}
+        self.reverse_condition_map = {v: k for k, v in self.condition_map.items()}
+        self.record_type_map = {label: i for i, label in enumerate(set(train["record_type"]))}
+        self.reverse_record_type_map = {v: k for k, v in self.record_type_map.items()}
 
-            print("Filtering out problematic samples for training", flush=True)
-            train_full = self._prep_and_filter(ds[self.train_split])
 
-            # If val split exists, filter it too; otherwise create val/test from filtered train_full.
-            if self.val_split in ds:
-                print("Filtering out problematic samples for validation", flush=True)
-                val = self._prep_and_filter(ds[self.val_split])
+        train = train.map(
+            self.tokenize_function,
+            batched=False,
+            remove_columns=["text", "condition", "record_type"],
+        )
+        val = val.map(
+            self.tokenize_function,
+            batched=False,
+            remove_columns=["text", "condition", "record_type"],
+        )
+        test = test.map(
+            self.tokenize_function,
+            batched=False,
+            remove_columns=["text", "condition", "record_type"],
+        )
+        self.test = test  # keep raw for inference later
+        self.train_ds = train
+        self.val_ds = val
+        self.test_ds = test
 
-                # Create test split same size as val (from dataset test split if exists, else from train_full).
-                val_n = len(val)
+    def tokenize_function(self, example: Dict[str, Any]) -> Dict[str, Any]:
+        inputs = self.tokenizer(
+            f"Choose the condition and the record type of the following medical note: {example['text']}",
+            truncation=True,
+            max_length=self.max_length,
+        )
+        inputs["label1"] = self.condition_map[example["condition"]]
+        inputs["label2"] = self.record_type_map[example["record_type"]]
+        return inputs
 
-                if "test" in ds:
-                    print("Filtering out problematic samples for testing", flush=True)
-                    test_full = self._prep_and_filter(ds["test"])
-                    test_n = min(val_n, len(test_full))
-                    test = test_full.shuffle(seed=self.seed).select(range(test_n))
-                else:
-                    # sample from train_full without overlap with train by taking from a shuffled view
-                    shuffled = train_full.shuffle(seed=self.seed)
-                    test_n = min(val_n, len(shuffled))
-                    test = shuffled.select(range(test_n))
+    def collate_fn(self, batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        input_ids = pad_sequence(
+            [torch.tensor(ex["input_ids"], dtype=torch.long) for ex in batch],
+            batch_first=True,
+            padding_value=self.tokenizer.pad_token_id,
+        )
+        attention_mask = pad_sequence(
+            [torch.tensor(ex["attention_mask"], dtype=torch.long) for ex in batch],
+            batch_first=True,
+            padding_value=0,
+        )
+        label1 = torch.tensor([ex["label1"] for ex in batch], dtype=torch.long)
+        label2 = torch.tensor([ex["label2"] for ex in batch], dtype=torch.long)
 
-                train = train_full
-
-            else:
-                # deterministic split: val then test then train
-                shuffled = train_full.shuffle(seed=self.seed)
-
-                val_n = min(self.val_size, len(shuffled))
-                test_n = min(val_n, max(0, len(shuffled) - val_n))  # same size as val if possible
-
-                val = shuffled.select(range(val_n))
-                test = shuffled.select(range(val_n, val_n + test_n))
-                train = shuffled.select(range(val_n + test_n, len(shuffled)))
-
-            print("Datasets are ready", flush=True)
-            self.train_ds = train
-            self.val_ds = val
-            self.test_ds = test
-            self._setup_done = True
-
-    def _extract_messages(self, example: Dict[str, Any]) -> List[Dict[str, str]]:
-        """
-        SlimOrca-Dedup uses a ShareGPT-like schema:
-        example["conversations"] = [{"from": "system"/"human"/"gpt", "value": "..."}...]
-        """
-        conv = example.get("conversations", None)
-        if conv is None:
-            raise KeyError("Expected a 'conversations' field in the dataset example.")
-
-        role_map = {
-            "system": "system",
-            "human": "user",
-            "gpt": "assistant",
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "label1": label1,
+            "label2": label2,
         }
 
-        messages: List[Dict[str, str]] = []
-        for turn in conv:
-            frm = turn.get("from")
-            val = turn.get("value")
-            if frm not in role_map or val is None:
-                continue
-            messages.append({"role": role_map[frm], "content": val})
-        return messages
-
-    def _build_prompt_and_full_text(self, messages: List[Dict[str, str]]) -> Tuple[str, str]:
-        """
-        We train only on the last assistant message.
-
-        prompt_messages = messages[:-1] + generation prompt
-        full_messages = messages (includes last assistant message)
-
-        If the last message isn't assistant, we skip by returning ("","").
-        """
-        if len(messages) < 2:
-            return "", ""
-
-        if messages[-1]["role"] != "assistant":
-            return "", ""
-
-        prompt_messages = messages[:-1]
-        full_messages = messages
-
-        # Qwen3 supports apply_chat_template; enable_thinking default can inject <think> blocks.
-        prompt_text = self.tokenizer.apply_chat_template(
-            prompt_messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=self.enable_thinking,
-        )
-        full_text = self.tokenizer.apply_chat_template(
-            full_messages,
-            tokenize=False,
-            add_generation_prompt=False,
-            enable_thinking=self.enable_thinking,
-        )
-        return prompt_text, full_text
-
-    def _collate(self, examples: List[Dict[str, Any]]) -> Batch:
-        # examples are guaranteed "good" by setup(); prompt/full already computed
-        prompt_texts = [ex["prompt_text"] for ex in examples]
-        full_texts   = [ex["full_text"] for ex in examples]
-
-        full_enc = self.tokenizer(
-            full_texts,
-            padding=True,
-            truncation=True,
-            max_length=self.max_length,
-            return_tensors="pt",
-        )
-        prompt_enc = self.tokenizer(
-            prompt_texts,
-            padding=True,
-            truncation=True,
-            max_length=self.max_length,
-            return_tensors="pt",
-        )
-
-        input_ids = full_enc["input_ids"]
-        attention_mask = full_enc["attention_mask"]
-
-        labels = input_ids.clone()
-
-        prompt_lens = prompt_enc["attention_mask"].sum(dim=1).tolist()
-        for i, plen in enumerate(prompt_lens):
-            labels[i, :int(plen)] = -100
-
-        labels[attention_mask == 0] = -100
-
-        return Batch(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-
-    def train_dataloader(self) -> DataLoader:
+    def train_dataloader(self):
         return DataLoader(
             self.train_ds,
-            batch_size=self.micro_batch_size,
+            batch_size=self.batch_size,
             shuffle=True,
+            collate_fn=self.collate_fn,
             num_workers=self.num_workers,
-            pin_memory=True,
-            collate_fn=self._collate,
-            drop_last=True,
         )
 
-    def val_dataloader(self) -> DataLoader:
+    def val_dataloader(self):
         return DataLoader(
             self.val_ds,
-            batch_size=self.micro_batch_size,
+            batch_size=self.batch_size,
             shuffle=False,
+            collate_fn=self.collate_fn,
             num_workers=self.num_workers,
-            pin_memory=True,
-            collate_fn=self._collate,
-            drop_last=False,
-        )
-    
-    def test_dataloader(self) -> DataLoader:
-        return DataLoader(
-            self.test_ds,
-            batch_size=self.micro_batch_size,
-            shuffle=False,
-            num_workers=self.num_workers,
-            pin_memory=True,
-            collate_fn=self._collate,
-            drop_last=False,
         )
 
 
-# -----------------------------
-# Model
-# -----------------------------
-class SFTLoRAModule(L.LightningModule):
+class EncoderDataModuleV2(L.LightningDataModule):
+    """
+    MLM prompt formulation. We also compute max_tokens from label strings (condition + record_type).
+    """
     def __init__(
         self,
-        model_name: str,
-        lr: float,
-        weight_decay: float,
-        warmup_steps: int,
-        max_steps: int,
-        grad_clip: float,
-        lora_r: int,
-        lora_alpha: int,
-        lora_dropout: float,
-        lora_target_modules: List[str],
-        save_dir: str,
+        dataset_name: str,
+        tokenizer_name: str,
+        test_and_val_size: float,
+        max_length: int,
+        batch_size: int,
+        num_workers: int,
+        seed: int,
     ):
         super().__init__()
+        self.dataset_name = dataset_name
+        self.tokenizer_name = tokenizer_name
+        self.test_and_val_size = test_and_val_size
+        self.max_length = max_length
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.seed = seed
+
+        self.train_ds = None
+        self.val_ds = None
+        self.test_ds = None
+
+    def prepare_data(self):
+        # Load dataset and tokenizer
+        load_dataset(self.dataset_name, split=self.train_split)
+        AutoTokenizer.from_pretrained(self.tokenizer_name)
+
+    def setup(self, stage: Optional[str] = None):
+
+        self.tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name)
+        self.dataset = load_dataset(self.dataset_name)
+        
+        train_val_split = self.dataset["train"].train_test_split(test_size=self.test_and_val_size, seed=self.seed)
+        train = train_val_split["train"]
+        
+        val_test_split = train_val_split["test"].train_test_split(test_size=0.5, seed=self.seed)
+        val = val_test_split["train"]
+        test = val_test_split["test"]
+
+        # label maps
+        self.condition_map = {label: i for i, label in enumerate(set(train["condition"]))}
+        self.reverse_condition_map = {v: k for k, v in self.condition_map.items()}
+        self.record_type_map = {label: i for i, label in enumerate(set(train["record_type"]))}
+        self.reverse_record_type_map = {v: k for k, v in self.record_type_map.items()}
+
+        self.max_tokens = self._compute_max_tokens()
+
+        train = train.map(
+            self.tokenize_function,
+            batched=False,
+            remove_columns=["text", "condition", "record_type"],
+        )
+        val = val.map(
+            self.tokenize_function,
+            batched=False,
+            remove_columns=["text", "condition", "record_type"],
+        )
+        test = test.map(
+            self.tokenize_function,
+            batched=False,
+            remove_columns=["text", "condition", "record_type"],
+        )
+
+        self.test = test  # keep raw for inference later
+        self.train_ds = train
+        self.val_ds = val
+        self.test_ds = test
+
+
+    def _compute_max_tokens(self) -> int:
+        max_tokens = 0
+        for label in list(self.condition_map.keys()) + list(self.record_type_map.keys()):
+            toks = self.tokenizer(label, add_special_tokens=False)["input_ids"]
+            max_tokens = max(max_tokens, len(toks))
+        return max_tokens
+
+    def tokenize_function(self, example: Dict[str, Any]) -> Dict[str, Any]:
+        condition_tokens = self.tokenizer(example["condition"], add_special_tokens=False)["input_ids"]
+        record_type_tokens = self.tokenizer(example["record_type"], add_special_tokens=False)["input_ids"]
+
+        prompt = (
+            f"Choose the condition and the record type of the following medical note: {example['text']}."
+            f" The condition is: {' '.join([self.tokenizer.mask_token] * self.max_tokens)};"
+            f" The record type is: {' '.join([self.tokenizer.mask_token] * self.max_tokens)}"
+        )
+
+        inputs = self.tokenizer(prompt, truncation=True, max_length=self.max_length)
+
+        token_ids = self.tokenizer.convert_ids_to_tokens(inputs["input_ids"])
+        labels = [token if token == self.tokenizer.mask_token else -100 for token in token_ids]
+        
+        # Replace first set of [MASK] tokens with correct labels
+        condition_done = False
+        start_span = False
+        start_span_idx = 0
+        for i in range(len(labels)):
+            if labels[i] == self.tokenizer.mask_token:
+                if not start_span:
+                    start_span = True
+                    start_span_idx = i
+            else:
+                if start_span:
+                    condition_done=True
+                    start_span = False
+
+            if start_span:
+                if not condition_done:
+                    labels[i] = condition_tokens[i - start_span_idx] if i-start_span_idx < len(condition_tokens) else self.tokenizer.pad_token_id
+                else:
+                    labels[i] = record_type_tokens[i - start_span_idx] if i-start_span_idx < len(record_type_tokens) else self.tokenizer.pad_token_id
+
+        # Squeeze the tensors to (seq_len), since the tokenizer puts outputs the shape (1, seq_len)
+        inputs["input_ids"] = inputs["input_ids"]
+        inputs["attention_mask"] = inputs["attention_mask"]
+        inputs["labels"] = labels
+
+        return inputs
+
+    def collate_fn(self, batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        input_ids = pad_sequence(
+            [torch.tensor(ex["input_ids"], dtype=torch.long) for ex in batch],
+            batch_first=True,
+            padding_value=self.tokenizer.pad_token_id,
+        )
+        attention_mask = pad_sequence(
+            [torch.tensor(ex["attention_mask"], dtype=torch.long) for ex in batch],
+            batch_first=True,
+            padding_value=0,
+        )
+        labels = pad_sequence(
+            [torch.tensor(ex["labels"], dtype=torch.long) for ex in batch],
+            batch_first=True,
+            padding_value=-100,
+        )
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+        }
+
+    def train_dataloader(self):
+        return DataLoader(
+            self.train_ds,
+            batch_size=self.batch_size,
+            shuffle=True,
+            collate_fn=self.collate_fn,
+            num_workers=self.num_workers,
+        )
+
+    def val_dataloader(self):
+        return DataLoader(
+            self.val_ds,
+            batch_size=self.batch_size,
+            shuffle=False,
+            collate_fn=self.collate_fn,
+            num_workers=self.num_workers,
+        )
+    
+    def test_dataloader(self):
+        return DataLoader(
+            self.test_ds,
+            batch_size=self.batch_size,
+            shuffle=False,
+            collate_fn=self.collate_fn,
+            num_workers=self.num_workers,
+        )
+
+
+# -------------------------
+# LightningModules
+# -------------------------
+class EncoderLightningModuleV1(L.LightningModule):
+    def __init__(self, model_name: str, lr: float = 1e-5, num_labels1: int = 5, num_labels2: int = 2):
+        super().__init__()
+        self.model_name = model_name
+        self.lr = lr
+        self.num_labels1 = num_labels1
+        self.num_labels2 = num_labels2
         self.save_hyperparameters()
 
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            model_name,
-            use_fast=True,
-            trust_remote_code=True,
-        )
+        self.model = EncoderWithTwoHeads(model_name, num_labels1, num_labels2)
+        self.loss_fn1 = torch.nn.CrossEntropyLoss()
+        self.loss_fn2 = torch.nn.CrossEntropyLoss()
 
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=torch.bfloat16 if torch.cuda.is_available() else None,
-            trust_remote_code=True,
-        )
+        # for epoch-end metrics
+        self.val_preds1 = []
+        self.val_preds2 = []
+        self.val_true1 = []
+        self.val_true2 = []
 
-        # PEFT LoRA
-        peft_config = LoraConfig(
-            r=lora_r,
-            lora_alpha=lora_alpha,
-            lora_dropout=lora_dropout,
-            bias="none",
-            task_type="CAUSAL_LM",
-            target_modules=lora_target_modules,
-        )
-        self.model = get_peft_model(self.model, peft_config)
+    def forward(self, input_ids, attention_mask):
+        return self.model(input_ids=input_ids, attention_mask=attention_mask)
 
-        self.max_steps = max_steps
+    def training_step(self, batch, batch_idx):
+        logits1, logits2 = self(batch["input_ids"], batch["attention_mask"])
+        loss1 = self.loss_fn1(logits1, batch["label1"])
+        loss2 = self.loss_fn2(logits2, batch["label2"])
+        loss = loss1 + loss2
+
+        self.log("train/loss", loss, prog_bar=True, on_step=True, on_epoch=False)
+        self.log("train/loss1", loss1, on_step=True, on_epoch=False)
+        self.log("train/loss2", loss2, on_step=True, on_epoch=False)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        logits1, logits2 = self(batch["input_ids"], batch["attention_mask"])
+        loss1 = self.loss_fn1(logits1, batch["label1"])
+        loss2 = self.loss_fn2(logits2, batch["label2"])
+        loss = loss1 + loss2
+
+        pred1 = torch.argmax(logits1, dim=1)
+        pred2 = torch.argmax(logits2, dim=1)
+
+        self.val_preds1.append(pred1.detach().cpu())
+        self.val_preds2.append(pred2.detach().cpu())
+        self.val_true1.append(batch["label1"].detach().cpu())
+        self.val_true2.append(batch["label2"].detach().cpu())
+
+        self.log("val/loss", loss, prog_bar=True, on_step=False, on_epoch=True)
+        return loss
+
+    def on_validation_epoch_end(self):
+        p1 = torch.cat(self.val_preds1).numpy() if self.val_preds1 else np.array([])
+        p2 = torch.cat(self.val_preds2).numpy() if self.val_preds2 else np.array([])
+        t1 = torch.cat(self.val_true1).numpy() if self.val_true1 else np.array([])
+        t2 = torch.cat(self.val_true2).numpy() if self.val_true2 else np.array([])
+
+        self.val_preds1.clear()
+        self.val_preds2.clear()
+        self.val_true1.clear()
+        self.val_true2.clear()
+
+        if len(t1) > 0:
+            f1_1 = f1_score(t1, p1, average="weighted")
+            acc_1 = accuracy_score(t1, p1)
+            self.log("val/f1_condition", f1_1, prog_bar=True)
+            self.log("val/acc_condition", acc_1, prog_bar=True)
+
+        if len(t2) > 0:
+            f1_2 = f1_score(t2, p2, average="weighted")
+            acc_2 = accuracy_score(t2, p2)
+            self.log("val/f1_record_type", f1_2, prog_bar=True)
+            self.log("val/acc_record_type", acc_2, prog_bar=True)
+
+    def configure_optimizers(self):
+        return AdamW(self.parameters(), lr=self.lr)
+
+
+class EncoderLightningModuleV2(L.LightningModule):
+    def __init__(self, model_name: str, lr: float = 1e-5):
+        super().__init__()
+        self.model_name = model_name
         self.lr = lr
-        self.weight_decay = weight_decay
-        self.warmup_steps = warmup_steps
-        self.grad_clip = grad_clip
-        # Helpful: prints trainable params on rank 0 only
-        self._log_trainable_params()
+        self.save_hyperparameters()
+        self.model = AutoModelForMaskedLM.from_pretrained(model_name)
 
-    @rank_zero_only
-    def _log_trainable_params(self):
-        trainable = 0
-        total = 0
-        for _, p in self.model.named_parameters():
-            total += p.numel()
-            if p.requires_grad:
-                trainable += p.numel()
-        print(f"[PEFT] Trainable params: {trainable:,} / {total:,} "
-              f"({100.0 * trainable / total:.4f}%)")
+    def forward(self, **batch):
+        return self.model(**batch)
 
-    def forward(self, input_ids, attention_mask, labels=None):
-        return self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=labels,
-        )
-
-    def training_step(self, batch: Batch, batch_idx: int):
-        out = self(
-            input_ids=batch.input_ids,
-            attention_mask=batch.attention_mask,
-            labels=batch.labels,
-        )
-        loss = out.loss
-        self.log("train/loss", loss, prog_bar=True, on_step=True, on_epoch=False, batch_size=batch.input_ids.size(0), sync_dist=True)
-
-        # if self.trainer.is_global_zero:
-        #     print(
-        #         f"optimizer_step={self.global_step}/{self.trainer.max_steps}",
-        #         flush=True
-        #     )
-
+    def training_step(self, batch, batch_idx):
+        outputs = self(**batch)
+        loss = outputs.loss
+        self.log("train/loss", loss, prog_bar=True, on_step=True, on_epoch=False)
         return loss
 
-    def validation_step(self, batch: Batch, batch_idx: int):
-        out = self(
-            input_ids=batch.input_ids,
-            attention_mask=batch.attention_mask,
-            labels=batch.labels,
-        )
-        loss = out.loss
-        self.log("val/loss", loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=batch.input_ids.size(0), sync_dist=True)
-        return loss
-    
-    def test_step(self, batch: Batch, batch_idx: int):
-        out = self(
-            input_ids=batch.input_ids,
-            attention_mask=batch.attention_mask,
-            labels=batch.labels,
-        )
-        loss = out.loss
-        self.log("test/loss", loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=batch.input_ids.size(0), sync_dist=True)
+    def validation_step(self, batch, batch_idx):
+        outputs = self(**batch)
+        loss = outputs.loss
+        self.log("val/loss", loss, prog_bar=True, on_step=False, on_epoch=True)
         return loss
 
     def configure_optimizers(self):
-        # AdamW
-        optimizer = AdamW8bit(
-            self.parameters(),
-            lr=self.lr,
-            weight_decay=self.weight_decay,
-            betas=(0.9, 0.95),
-            eps=1e-8,
+        return AdamW(self.parameters(), lr=self.lr)
+
+
+# -------------------------
+# Evaluation helpers (reload best ckpt easily)
+# -------------------------
+@torch.no_grad()
+def evaluate_best_v1(
+    ckpt_path: str,
+    datamodule: EncoderDataModuleV1,
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+) -> Dict[str, float]:
+    model = EncoderLightningModuleV1.load_from_checkpoint(ckpt_path, model_name=datamodule.tokenizer_name, num_labels1=datamodule.num_labels1, num_labels2=datamodule.num_labels2)
+    model.to(device)
+    model.eval()
+
+    # run on raw test set with tokenizer prompt (as your original)
+    tokenizer = datamodule.tokenizer
+    reverse_condition_map = datamodule.reverse_condition_map
+    reverse_record_type_map = datamodule.reverse_record_type_map
+
+    preds_cond, preds_rec = [], []
+    true_cond, true_rec = [], []
+
+    for ex in datamodule.dataset_test_raw:
+        inputs = tokenizer(
+            f"Choose the condition and the record type of the following medical note: {ex['text']}",
+            return_tensors="pt",
+            truncation=True,
+            max_length=datamodule.max_length,
+        ).to(device)
+
+        logits1, logits2 = model.model(**inputs)
+        c = torch.argmax(logits1, dim=1).item()
+        r = torch.argmax(logits2, dim=1).item()
+
+        preds_cond.append(reverse_condition_map[c])
+        preds_rec.append(reverse_record_type_map[r])
+
+        true_cond.append(ex["condition"])
+        true_rec.append(ex["record_type"])
+
+    f1_cond = f1_score(true_cond, preds_cond, average="weighted")
+    f1_rec = f1_score(true_rec, preds_rec, average="weighted")
+    acc_cond = accuracy_score(true_cond, preds_cond)
+    acc_rec = accuracy_score(true_rec, preds_rec)
+
+    return {
+        "test/f1_condition": f1_cond,
+        "test/f1_record_type": f1_rec,
+        "test/acc_condition": acc_cond,
+        "test/acc_record_type": acc_rec,
+    }
+
+
+@torch.no_grad()
+def evaluate_best_v2(
+    ckpt_path: str,
+    datamodule: EncoderDataModuleV2,
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+) -> Dict[str, float]:
+    model = EncoderLightningModuleV2.load_from_checkpoint(ckpt_path, model_name=datamodule.tokenizer_name, lr=datamodule.lr)
+    model.to(device)
+    model.eval()
+
+    tokenizer = datamodule.tokenizer
+    max_tokens = datamodule.max_tokens
+
+    preds_cond, preds_rec = [], []
+    true_cond, true_rec = [], []
+
+    for ex in datamodule.dataset_test_raw:
+        prompt = (
+            f"Choose the condition and the record type of the following medical note: {ex['text']}."
+            f" The condition is: {' '.join([tokenizer.mask_token] * max_tokens)};"
+            f" The record type is: {' '.join([tokenizer.mask_token] * max_tokens)}"
         )
+        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=datamodule.max_length).to(device)
+        outputs = model.model(**inputs)
+        logits = outputs.logits  # [1, T, V]
 
-        # Linear warmup then linear decay
-        scheduler = get_linear_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=self.warmup_steps,
-            num_training_steps=self.max_steps,
-        )
+        mask_positions = torch.where(inputs["input_ids"] == tokenizer.mask_token_id)[1]
+        pred_ids = inputs["input_ids"].clone().squeeze(0)
 
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "interval": "step",
-                "frequency": 1,
-            },
-        }
-    
-class OptimStepProgressBar(TQDMProgressBar):
-    def init_train_tqdm(self):
-        bar = super().init_train_tqdm()
-        if self.trainer.max_steps and self.trainer.max_steps > 0:
-            bar.total = self.trainer.max_steps
-        return bar
+        for pos in mask_positions:
+            token_logits = logits[0, pos, :]
+            pred_ids[pos] = torch.argmax(token_logits, dim=-1)
 
-    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-        # Show optimizer-step progress, not batch progress
-        if self.train_progress_bar is not None:
-            self.train_progress_bar.n = trainer.global_step
-            self.train_progress_bar.set_postfix({
-                "step": f"{trainer.global_step}/{trainer.max_steps}"
-            })
-            self.train_progress_bar.refresh()
+        decoded = tokenizer.decode(pred_ids, skip_special_tokens=True).lower()
+
+        # robust-ish parsing (still heuristic, like your original)
+        try:
+            cond = decoded.split("the condition is : ")[1].split(";")[0].strip()
+            rec = decoded.split("the record type is : ")[1].strip()
+        except Exception:
+            cond, rec = "", ""
+
+        preds_cond.append(cond)
+        preds_rec.append(rec)
+        true_cond.append(ex["condition"].lower())
+        true_rec.append(ex["record_type"].lower())
+
+    f1_cond = f1_score(true_cond, preds_cond, average="weighted")
+    f1_rec = f1_score(true_rec, preds_rec, average="weighted")
+    acc_cond = accuracy_score(true_cond, preds_cond)
+    acc_rec = accuracy_score(true_rec, preds_rec)
+
+    return {
+        "test/f1_condition": f1_cond,
+        "test/f1_record_type": f1_rec,
+        "test/acc_condition": acc_cond,
+        "test/acc_record_type": acc_rec,
+    }
+
 
 # -----------------------------
 # Training loop (called by main)
 # -----------------------------
-def run_training(
+def run_encoder_training(
     *,
     seed: int,
-    dataset_name: str,
+    version: int,
     model_name: str,
-    max_length: int,
-    micro_batch_size: int,
+    num_epochs: int,
     grad_accum: int,
-    num_workers: int,
-    val_size: int,
-    lr: float,
-    weight_decay: float,
-    warmup_steps: int,
-    max_steps: int,
+    early_stop_patience: int,
+    max_length: int,
+    batch_size: int,
+    learning_rate: float,
     log_every_n_steps: int,
-    val_check_interval: int,
     save_dir: str,
-    precision: str,
-    devices: int,
-    strategy: str,
-    enable_thinking: bool,
-    # LoRA
-    lora_r: int,
-    lora_alpha: int,
-    lora_dropout: float,
-    lora_target_modules: List[str],
+    accelerator: str = "auto",
+    devices: Union[str, int] = "auto",
+    precision: str = "32-true",
+    eval_only: bool = False,
+    run_name: Optional[str] = None,
 ):
     L.seed_everything(seed, workers=True)
 
+    spec = get_encoder_spec(version)
 
-    dm = SlimOrcaDataModule(
-        dataset_name=dataset_name,
+    run_name = spec.saved_model_name
+    ckpt_dir = os.path.join(save_dir, run_name)
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    # ---- DataModule / Model ----
+    dm = spec.datamodule_cls(
+        dataset_name="karenwky/pet-health-symptoms-dataset",
         tokenizer_name=model_name,
-        train_split="train",
-        val_split="validation",  # if missing, we create one from train
-        val_size=val_size,
+        test_and_val_size=0.2,
         max_length=max_length,
-        micro_batch_size=micro_batch_size,
-        num_workers=num_workers,
+        batch_size=batch_size,
+        num_workers=4,
         seed=seed,
-        enable_thinking=enable_thinking,
     )
+    lit_model = spec.lit_model_cls(model_name=model_name, lr=learning_rate)
 
-    lit_model = SFTLoRAModule(
-        model_name=model_name,
-        lr=lr,
-        weight_decay=weight_decay,
-        warmup_steps=warmup_steps,
-        max_steps=max_steps,
-        grad_clip=1.0,
-        lora_r=lora_r,
-        lora_alpha=lora_alpha,
-        lora_dropout=lora_dropout,
-        lora_target_modules=lora_target_modules,
-        save_dir=save_dir,
-    )
 
-    # ---- W&B Logger ----
-    wandb_logger = WandbLogger(
+    # ---- Logger ----
+    wandb_key = os.getenv("WANDB_KEY")
+    if wandb_key:
+        # Authenticate using the key
+        login(key=wandb_key)
+        print("Successfully logged into wandb.")
+    else:
+        print("Error: WANDB_API_KEY environment variable not found.")
+    logger = WandbLogger(
         project="oceanprotocol",
-        name="qwen3-8b-slimorca",
+        name=run_name,
     )
 
-    # ---- Checkpointing ----
-    checkpoint_callback = ModelCheckpoint(
-        dirpath=save_dir,
-        filename="step-{step}-val_loss-{val/loss:.4f}",
-        monitor="val/loss",
-        mode="min",
+    # ---- Checkpointing / Early stopping ----
+    checkpoint_cb = ModelCheckpoint(
+        dirpath=ckpt_dir,
+        filename="best",
         save_top_k=1,
-        save_last=True,
-        verbose=True,
+        monitor=spec.monitor_metric,
+        mode=spec.monitor_mode,
+        save_last=False,  # set to True if you also want to keep track of the last epoch's checkpoint (handy for resuming if interrupted, but can use more storage
+    )
+    earlystop_cb = EarlyStopping(
+        monitor=spec.monitor_metric,
+        mode=spec.monitor_mode,
+        patience=early_stop_patience,
     )
 
+    # ---- Trainer ----
     trainer = L.Trainer(
-        accelerator="gpu" if torch.cuda.is_available() else "cpu",
-        devices=devices if torch.cuda.is_available() else 1,
-        strategy=strategy if torch.cuda.is_available() and devices > 1 else "auto",
-        precision=precision if torch.cuda.is_available() else "32-true",
-        max_steps=max_steps,
+        accelerator=accelerator,
+        devices=devices,
+        precision=precision,
+        max_epochs=num_epochs,
         accumulate_grad_batches=grad_accum,
+        callbacks=[checkpoint_cb, earlystop_cb],
+        logger=logger,
         log_every_n_steps=log_every_n_steps,
-        val_check_interval=val_check_interval,
-        gradient_clip_val=1.0,
-        gradient_clip_algorithm="norm",
-        logger=wandb_logger,
-        callbacks=[checkpoint_callback, OptimStepProgressBar()],
-        default_root_dir=save_dir,
-        deterministic=True
+        default_root_dir=ckpt_dir,
+        deterministic=True,
     )
 
-    from pathlib import Path
-    path = Path("/data/outputs/my_folder/test.txt") 
-    path.parent.mkdir(parents=True, exist_ok=True) 
-    with path.open("w", encoding="utf-8") as f: 
-        f.write("test works")
+    dm.setup()
 
-    print("Starting Initial Validation!", flush=True)
-    trainer.validate(lit_model, datamodule=dm)
-    print("Starting Training!", flush=True)
-    trainer.fit(lit_model, datamodule=dm)
-    print("Starting Final Testing!", flush=True)
-    trainer.test(model=lit_model, datamodule=dm)
+    if not eval_only:
+        trainer.fit(lit_model, datamodule=dm)
+
+    # ---- Resolve best checkpoint, save tokenizer, eval ----
+    best_ckpt_path = resolve_best_ckpt(checkpoint_cb, ckpt_dir)
+
+    metrics = spec.eval_fn(best_ckpt_path, dm)
+    print("\n=== Best checkpoint test metrics ===")
+    for k, v in metrics.items():
+        print(f"{k}: {v}")
+
+    print(f"\nBest checkpoint: {best_ckpt_path}")
+    print(f"Tokenizer saved to: {ckpt_dir}")
 
 
-# -----------------------------
-# main
-# -----------------------------
+# -------------------------
+# Main
+# -------------------------
 def main():
     # -------------------------
     # Constants (all here)
     # -------------------------
     SEED = 42
 
-    # Dataset
-    DATASET_NAME = "Open-Orca/SlimOrca-Dedup"
-    VAL_SIZE = 2000  # created from train if no validation split exists
-
     # Model
-    MODEL_NAME = "Qwen/Qwen3-8B"
-
-    # Qwen3 chat template option: disable thinking so training text doesn't include <think> blocks.
-    ENABLE_THINKING = False
+    MODEL_NAME = "answerdotai/ModernBERT-large"
 
     # Tokenization / batching
-    MAX_LENGTH = 4096
-    MICRO_BATCH_SIZE = 1              # per GPU
-    GRAD_ACCUM = 16                   # effective batch = MICRO_BATCH_SIZE * GRAD_ACCUM * num_gpus
-    NUM_WORKERS = 4
+    MAX_LENGTH = 1028
+    BATCH_SIZE = 16              # per GPU
+    GRAD_ACCUM = 1                   # effective batch = BATCH_SIZE * GRAD_ACCUM
 
     # Training
-    LR = 1e-6
-    WEIGHT_DECAY = 0.0
-    WARMUP_STEPS = 200
-    MAX_STEPS = 1000
+    LR = 5e-5
     LOG_EVERY_N_STEPS = 1
-    VAL_CHECK_INTERVAL = 500
-
-    # Multi-GPU
-    DEVICES = torch.cuda.device_count()   # set NUM_GPUS=8 etc.
-    STRATEGY = "ddp_find_unused_parameters_false"    # often best for HF + PEFT
+    NUM_EPOCHS = 30
+    EARLY_STOP_PATIENCE = 5
 
     # Precision
     PRECISION = "bf16-mixed"  # if your GPUs support bf16; otherwise use "16-mixed"
 
     # Output
-    SAVE_DIR = "/data/outputs/qwen3_8b_slimorca_lora_adapter"
+    SAVE_DIR = "/data/outputs/encoder_finetuning"
 
-    # LoRA config
-    LORA_R = 16
-    LORA_ALPHA = 32
-    LORA_DROPOUT = 0.05
-
-    # Target modules:
-    # Qwen-style architectures commonly respond well to targeting attention + MLP projections.
-    LORA_TARGET_MODULES = [
-        "q_proj",
-        "k_proj",
-        "v_proj",
-        "o_proj",
-        "gate_proj",
-        "up_proj",
-        "down_proj",
-    ]
+    # Version: 
+    # 1: Encoder backbone with classification heads
+    # 2: Encoder with masked token prediction-style classification
+    VERSION = 1
 
     wandb_key = os.getenv("WANDB_KEY")
     if wandb_key:
@@ -612,33 +758,23 @@ def main():
     else:
         print("Error: WANDB_API_KEY environment variable not found.")
 
-    # -------------------------
-    # Call training loop
-    # -------------------------
-    run_training(
+    run_encoder_training(
         seed=SEED,
-        dataset_name=DATASET_NAME,
+        version=VERSION,
         model_name=MODEL_NAME,
-        max_length=MAX_LENGTH,
-        micro_batch_size=MICRO_BATCH_SIZE,
+        num_epochs=NUM_EPOCHS,
         grad_accum=GRAD_ACCUM,
-        num_workers=NUM_WORKERS,
-        val_size=VAL_SIZE,
-        lr=LR,
-        weight_decay=WEIGHT_DECAY,
-        warmup_steps=WARMUP_STEPS,
-        max_steps=MAX_STEPS,
+        early_stop_patience=EARLY_STOP_PATIENCE,
+        max_length=MAX_LENGTH,
+        batch_size=BATCH_SIZE,
+        learning_rate=LR,
         log_every_n_steps=LOG_EVERY_N_STEPS,
-        val_check_interval=VAL_CHECK_INTERVAL,
         save_dir=SAVE_DIR,
+        accelerator="auto",
+        devices="auto",
         precision=PRECISION,
-        devices=DEVICES,
-        strategy=STRATEGY,
-        enable_thinking=ENABLE_THINKING,
-        lora_r=LORA_R,
-        lora_alpha=LORA_ALPHA,
-        lora_dropout=LORA_DROPOUT,
-        lora_target_modules=LORA_TARGET_MODULES,
+        eval_only=False,  # True to skip training and only eval best ckpt
+        run_name=None,  # or "my_run_name"
     )
 
 

@@ -366,12 +366,6 @@ class SFTLoRAModule(L.LightningModule):
         loss = out.loss
         self.log("train/loss", loss, prog_bar=True, on_step=True, on_epoch=False, batch_size=batch.input_ids.size(0), sync_dist=True)
 
-        # if self.trainer.is_global_zero:
-        #     print(
-        #         f"optimizer_step={self.global_step}/{self.trainer.max_steps}",
-        #         flush=True
-        #     )
-
         return loss
 
     def validation_step(self, batch: Batch, batch_idx: int):
