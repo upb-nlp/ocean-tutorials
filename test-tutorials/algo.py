@@ -422,7 +422,6 @@ class EncoderLightningModuleV1(L.LightningModule):
         return self.model(input_ids=input_ids, attention_mask=attention_mask)
 
     def training_step(self, batch, batch_idx):
-        print(f"Training step, batch_idx={batch_idx}, input_ids shape={batch['input_ids'].shape}, input_ids type={type(batch['input_ids'])}")
         logits1, logits2 = self(batch["input_ids"], batch["attention_mask"])
         loss1 = self.loss_fn1(logits1, batch["condition"])
         loss2 = self.loss_fn2(logits2, batch["record_type"])
@@ -534,8 +533,6 @@ def evaluate_best_v1(
         true_cond.append(batch["condition"])
         true_rec.append(batch["record_type"])
 
-    print(f"Preds cond: {preds_cond[:10]}, true cond: {true_cond[:10]}")
-    print(f"Preds rec: {preds_rec[:10]}, true rec: {true_rec[:10]}")
     f1_cond = f1_score(true_cond, preds_cond, average="weighted")
     f1_rec = f1_score(true_rec, preds_rec, average="weighted")
     acc_cond = accuracy_score(true_cond, preds_cond)
