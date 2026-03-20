@@ -129,6 +129,7 @@ class EncoderDataModuleV1(L.LightningDataModule):
         self.seed = seed
 
     def prepare_data(self):
+
         # Load dataset and tokenizer
         load_dataset(self.dataset_name)
         AutoTokenizer.from_pretrained(self.tokenizer_name)
@@ -178,8 +179,8 @@ class EncoderDataModuleV1(L.LightningDataModule):
             truncation=True,
             max_length=self.max_length,
         )
-        inputs["label1"] = self.condition_map[example["condition"]]
-        inputs["label2"] = self.record_type_map[example["record_type"]]
+        inputs["condition"] = self.condition_map[example["condition"]]
+        inputs["record_type"] = self.record_type_map[example["record_type"]]
         return inputs
 
     def collate_fn(self, batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
@@ -193,14 +194,14 @@ class EncoderDataModuleV1(L.LightningDataModule):
             batch_first=True,
             padding_value=0,
         )
-        label1 = torch.tensor([ex["label1"] for ex in batch], dtype=torch.long)
-        label2 = torch.tensor([ex["label2"] for ex in batch], dtype=torch.long)
+        condition = torch.tensor([ex["condition"] for ex in batch], dtype=torch.long)
+        record_type = torch.tensor([ex["record_type"] for ex in batch], dtype=torch.long)
 
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
-            "label1": label1,
-            "label2": label2,
+            "condition": condition,
+            "record_type": record_type,
         }
 
     def train_dataloader(self):
@@ -339,9 +340,9 @@ class EncoderDataModuleV2(L.LightningDataModule):
                     labels[i] = record_type_tokens[i - start_span_idx] if i-start_span_idx < len(record_type_tokens) else self.tokenizer.pad_token_id
 
         # Squeeze the tensors to (seq_len), since the tokenizer puts outputs the shape (1, seq_len)
-        inputs["input_ids"] = inputs["input_ids"]
-        inputs["attention_mask"] = inputs["attention_mask"]
-        inputs["labels"] = labels
+        inputs["input_ids"] = torch.tensor(inputs["input_ids"], dtype=torch.long)
+        inputs["attention_mask"] = torch.tensor(inputs["attention_mask"], dtype=torch.long)
+        inputs["labels"] = torch.tensor(labels, dtype=torch.long)
 
         return inputs
 
@@ -421,9 +422,10 @@ class EncoderLightningModuleV1(L.LightningModule):
         return self.model(input_ids=input_ids, attention_mask=attention_mask)
 
     def training_step(self, batch, batch_idx):
+        print(f"Training step, batch_idx={batch_idx}, input_ids shape={batch['input_ids'].shape}, input_ids type={type(batch['input_ids'])}")
         logits1, logits2 = self(batch["input_ids"], batch["attention_mask"])
-        loss1 = self.loss_fn1(logits1, batch["label1"])
-        loss2 = self.loss_fn2(logits2, batch["label2"])
+        loss1 = self.loss_fn1(logits1, batch["condition"])
+        loss2 = self.loss_fn2(logits2, batch["record_type"])
         loss = loss1 + loss2
 
         self.log("train/loss", loss, prog_bar=True, on_step=True, on_epoch=False)
@@ -433,8 +435,8 @@ class EncoderLightningModuleV1(L.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         logits1, logits2 = self(batch["input_ids"], batch["attention_mask"])
-        loss1 = self.loss_fn1(logits1, batch["label1"])
-        loss2 = self.loss_fn2(logits2, batch["label2"])
+        loss1 = self.loss_fn1(logits1, batch["condition"])
+        loss2 = self.loss_fn2(logits2, batch["record_type"])
         loss = loss1 + loss2
 
         pred1 = torch.argmax(logits1, dim=1)
@@ -442,8 +444,8 @@ class EncoderLightningModuleV1(L.LightningModule):
 
         self.val_preds1.append(pred1.detach().cpu())
         self.val_preds2.append(pred2.detach().cpu())
-        self.val_true1.append(batch["label1"].detach().cpu())
-        self.val_true2.append(batch["label2"].detach().cpu())
+        self.val_true1.append(batch["condition"].detach().cpu())
+        self.val_true2.append(batch["record_type"].detach().cpu())
 
         self.log("val/loss", loss, prog_bar=True, on_step=False, on_epoch=True)
         return loss
@@ -511,36 +513,29 @@ def evaluate_best_v1(
     datamodule: EncoderDataModuleV1,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> Dict[str, float]:
-    model = EncoderLightningModuleV1.load_from_checkpoint(ckpt_path, model_name=datamodule.tokenizer_name, num_labels1=datamodule.num_labels1, num_labels2=datamodule.num_labels2)
+    model = EncoderLightningModuleV1.load_from_checkpoint(ckpt_path, model_name=datamodule.tokenizer_name)
     model.to(device)
     model.eval()
-
-    # run on raw test set with tokenizer prompt (as your original)
-    tokenizer = datamodule.tokenizer
-    reverse_condition_map = datamodule.reverse_condition_map
-    reverse_record_type_map = datamodule.reverse_record_type_map
 
     preds_cond, preds_rec = [], []
     true_cond, true_rec = [], []
 
-    for ex in datamodule.dataset_test_raw:
-        inputs = tokenizer(
-            f"Choose the condition and the record type of the following medical note: {ex['text']}",
-            return_tensors="pt",
-            truncation=True,
-            max_length=datamodule.max_length,
-        ).to(device)
+    for batch in datamodule.test_ds:
+        input_ids = torch.tensor(batch["input_ids"], dtype=torch.long).unsqueeze(0).to(device)
+        attention_mask = torch.tensor(batch["attention_mask"], dtype=torch.long).unsqueeze(0).to(device)
 
-        logits1, logits2 = model.model(**inputs)
+        logits1, logits2 = model.model(input_ids=input_ids, attention_mask=attention_mask)
         c = torch.argmax(logits1, dim=1).item()
         r = torch.argmax(logits2, dim=1).item()
 
-        preds_cond.append(reverse_condition_map[c])
-        preds_rec.append(reverse_record_type_map[r])
+        preds_cond.append(c)
+        preds_rec.append(r)
 
-        true_cond.append(ex["condition"])
-        true_rec.append(ex["record_type"])
+        true_cond.append(batch["condition"])
+        true_rec.append(batch["record_type"])
 
+    print(f"Preds cond: {preds_cond[:10]}, true cond: {true_cond[:10]}")
+    print(f"Preds rec: {preds_rec[:10]}, true rec: {true_rec[:10]}")
     f1_cond = f1_score(true_cond, preds_cond, average="weighted")
     f1_rec = f1_score(true_rec, preds_rec, average="weighted")
     acc_cond = accuracy_score(true_cond, preds_cond)
@@ -560,28 +555,25 @@ def evaluate_best_v2(
     datamodule: EncoderDataModuleV2,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> Dict[str, float]:
-    model = EncoderLightningModuleV2.load_from_checkpoint(ckpt_path, model_name=datamodule.tokenizer_name, lr=datamodule.lr)
+    model = EncoderLightningModuleV2.load_from_checkpoint(ckpt_path, model_name=datamodule.tokenizer_name)
     model.to(device)
     model.eval()
 
     tokenizer = datamodule.tokenizer
-    max_tokens = datamodule.max_tokens
 
     preds_cond, preds_rec = [], []
     true_cond, true_rec = [], []
 
-    for ex in datamodule.dataset_test_raw:
-        prompt = (
-            f"Choose the condition and the record type of the following medical note: {ex['text']}."
-            f" The condition is: {' '.join([tokenizer.mask_token] * max_tokens)};"
-            f" The record type is: {' '.join([tokenizer.mask_token] * max_tokens)}"
-        )
-        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=datamodule.max_length).to(device)
-        outputs = model.model(**inputs)
+    for batch in datamodule.test_ds:
+        input_ids = torch.tensor(batch["input_ids"], dtype=torch.long).unsqueeze(0).to(device)
+        attention_mask = torch.tensor(batch["attention_mask"], dtype=torch.long).unsqueeze(0).to(device)
+
+        outputs = model.model(input_ids=input_ids, attention_mask=attention_mask)
         logits = outputs.logits  # [1, T, V]
 
-        mask_positions = torch.where(inputs["input_ids"] == tokenizer.mask_token_id)[1]
-        pred_ids = inputs["input_ids"].clone().squeeze(0)
+        mask_positions = torch.where(input_ids == tokenizer.mask_token_id)[1]
+        print(mask_positions, tokenizer.mask_token_id, tokenizer.mask_token, input_ids)
+        pred_ids = input_ids.clone().squeeze(0)
 
         for pos in mask_positions:
             token_logits = logits[0, pos, :]
@@ -589,17 +581,17 @@ def evaluate_best_v2(
 
         decoded = tokenizer.decode(pred_ids, skip_special_tokens=True).lower()
 
-        # robust-ish parsing (still heuristic, like your original)
         try:
-            cond = decoded.split("the condition is : ")[1].split(";")[0].strip()
-            rec = decoded.split("the record type is : ")[1].strip()
+            cond = decoded.split("the condition is: ")[1].split(";")[0].strip()
+            rec = decoded.split("the record type is: ")[1].strip()
         except Exception:
             cond, rec = "", ""
 
         preds_cond.append(cond)
         preds_rec.append(rec)
-        true_cond.append(ex["condition"].lower())
-        true_rec.append(ex["record_type"].lower())
+        true_cond.append(batch["condition"].lower())
+        true_rec.append(batch["record_type"].lower())
+        print(cond, rec, batch["condition"], batch["record_type"])
 
     f1_cond = f1_score(true_cond, preds_cond, average="weighted")
     f1_rec = f1_score(true_rec, preds_rec, average="weighted")
@@ -748,7 +740,7 @@ def main():
     # Version: 
     # 1: Encoder backbone with classification heads
     # 2: Encoder with masked token prediction-style classification
-    VERSION = 1
+    VERSION = 2
 
     wandb_key = os.getenv("WANDB_KEY")
     if wandb_key:
