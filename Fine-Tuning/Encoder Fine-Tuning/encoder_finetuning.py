@@ -6,8 +6,10 @@ from typing import Any, Dict, List, Optional, Tuple, Type, Callable, Union
 import numpy as np
 import pandas as pd
 import torch
+
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader
+from torch.optim import AdamW
 
 import lightning as L
 from lightning.pytorch.loggers import WandbLogger
@@ -17,8 +19,8 @@ from transformers import (
     AutoTokenizer,
     AutoModel,
     AutoModelForMaskedLM,
-    AdamW,
 )
+
 
 from datasets import Dataset, load_dataset
 from sklearn.metrics import f1_score, accuracy_score
@@ -34,7 +36,7 @@ class Batch:
     attention_mask: torch.Tensor
     labels: torch.Tensor
 
-dataclass(frozen=True)
+@dataclass(frozen=True)
 class EncoderSpec:
     saved_model_name: str
     datamodule_cls: Type[Any]
@@ -96,7 +98,8 @@ class EncoderWithTwoHeads(torch.nn.Module):
 
     def forward(self, input_ids, attention_mask=None):
         outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
-        pooled = outputs.pooler_output  # [B, H]
+        mask = attention_mask.unsqueeze(-1).float()
+        pooled = (outputs.last_hidden_state * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-9)
         logits1 = self.classifier1(pooled)
         logits2 = self.classifier2(pooled)
         return logits1, logits2
@@ -126,6 +129,7 @@ class EncoderDataModuleV1(L.LightningDataModule):
         self.seed = seed
 
     def prepare_data(self):
+
         # Load dataset and tokenizer
         load_dataset(self.dataset_name)
         AutoTokenizer.from_pretrained(self.tokenizer_name)
@@ -143,9 +147,9 @@ class EncoderDataModuleV1(L.LightningDataModule):
         test = val_test_split["test"]
 
         # label maps
-        self.condition_map = {label: i for i, label in enumerate(pd.unique(self.train["condition"]))}
+        self.condition_map = {label: i for i, label in enumerate(set(train["condition"]))}
         self.reverse_condition_map = {v: k for k, v in self.condition_map.items()}
-        self.record_type_map = {label: i for i, label in enumerate(pd.unique(self.train["record_type"]))}
+        self.record_type_map = {label: i for i, label in enumerate(set(train["record_type"]))}
         self.reverse_record_type_map = {v: k for k, v in self.record_type_map.items()}
 
 
@@ -175,8 +179,8 @@ class EncoderDataModuleV1(L.LightningDataModule):
             truncation=True,
             max_length=self.max_length,
         )
-        inputs["label1"] = self.condition_map[example["condition"]]
-        inputs["label2"] = self.record_type_map[example["record_type"]]
+        inputs["condition"] = self.condition_map[example["condition"]]
+        inputs["record_type"] = self.record_type_map[example["record_type"]]
         return inputs
 
     def collate_fn(self, batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
@@ -190,14 +194,14 @@ class EncoderDataModuleV1(L.LightningDataModule):
             batch_first=True,
             padding_value=0,
         )
-        label1 = torch.tensor([ex["label1"] for ex in batch], dtype=torch.long)
-        label2 = torch.tensor([ex["label2"] for ex in batch], dtype=torch.long)
+        condition = torch.tensor([ex["condition"] for ex in batch], dtype=torch.long)
+        record_type = torch.tensor([ex["record_type"] for ex in batch], dtype=torch.long)
 
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
-            "label1": label1,
-            "label2": label2,
+            "condition": condition,
+            "record_type": record_type,
         }
 
     def train_dataloader(self):
@@ -248,7 +252,7 @@ class EncoderDataModuleV2(L.LightningDataModule):
 
     def prepare_data(self):
         # Load dataset and tokenizer
-        load_dataset(self.dataset_name, split=self.train_split)
+        load_dataset(self.dataset_name)
         AutoTokenizer.from_pretrained(self.tokenizer_name)
 
     def setup(self, stage: Optional[str] = None):
@@ -264,9 +268,9 @@ class EncoderDataModuleV2(L.LightningDataModule):
         test = val_test_split["test"]
 
         # label maps
-        self.condition_map = {label: i for i, label in enumerate(pd.unique(train["condition"]))}
+        self.condition_map = {label: i for i, label in enumerate(set(train["condition"]))}
         self.reverse_condition_map = {v: k for k, v in self.condition_map.items()}
-        self.record_type_map = {label: i for i, label in enumerate(pd.unique(train["record_type"]))}
+        self.record_type_map = {label: i for i, label in enumerate(set(train["record_type"]))}
         self.reverse_record_type_map = {v: k for k, v in self.record_type_map.items()}
 
         self.max_tokens = self._compute_max_tokens()
@@ -336,9 +340,11 @@ class EncoderDataModuleV2(L.LightningDataModule):
                     labels[i] = record_type_tokens[i - start_span_idx] if i-start_span_idx < len(record_type_tokens) else self.tokenizer.pad_token_id
 
         # Squeeze the tensors to (seq_len), since the tokenizer puts outputs the shape (1, seq_len)
-        inputs["input_ids"] = inputs["input_ids"]
-        inputs["attention_mask"] = inputs["attention_mask"]
-        inputs["labels"] = labels
+        inputs["input_ids"] = torch.tensor(inputs["input_ids"], dtype=torch.long)
+        inputs["attention_mask"] = torch.tensor(inputs["attention_mask"], dtype=torch.long)
+        inputs["labels"] = torch.tensor(labels, dtype=torch.long)
+        inputs["condition"] = torch.tensor(self.condition_map[example["condition"]], dtype=torch.long)
+        inputs["record_type"] = torch.tensor(self.record_type_map[example["record_type"]], dtype=torch.long)
 
         return inputs
 
@@ -358,10 +364,16 @@ class EncoderDataModuleV2(L.LightningDataModule):
             batch_first=True,
             padding_value=-100,
         )
+        condition = torch.stack([torch.tensor(ex["condition"]) for ex in batch])
+        record_type = torch.stack([torch.tensor(ex["record_type"]) for ex in batch])
+
+
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "labels": labels,
+            "condition": condition,
+            "record_type": record_type,
         }
 
     def train_dataloader(self):
@@ -419,19 +431,19 @@ class EncoderLightningModuleV1(L.LightningModule):
 
     def training_step(self, batch, batch_idx):
         logits1, logits2 = self(batch["input_ids"], batch["attention_mask"])
-        loss1 = self.loss_fn1(logits1, batch["label1"])
-        loss2 = self.loss_fn2(logits2, batch["label2"])
+        loss1 = self.loss_fn1(logits1, batch["condition"])
+        loss2 = self.loss_fn2(logits2, batch["record_type"])
         loss = loss1 + loss2
 
-        self.log("train/loss", loss, prog_bar=True, on_step=True, on_epoch=True)
-        self.log("train/loss1", loss1, on_step=True, on_epoch=True)
-        self.log("train/loss2", loss2, on_step=True, on_epoch=True)
+        self.log("train/loss", loss, prog_bar=True, on_step=True, on_epoch=False)
+        self.log("train/loss1", loss1, on_step=True, on_epoch=False)
+        self.log("train/loss2", loss2, on_step=True, on_epoch=False)
         return loss
 
     def validation_step(self, batch, batch_idx):
         logits1, logits2 = self(batch["input_ids"], batch["attention_mask"])
-        loss1 = self.loss_fn1(logits1, batch["label1"])
-        loss2 = self.loss_fn2(logits2, batch["label2"])
+        loss1 = self.loss_fn1(logits1, batch["condition"])
+        loss2 = self.loss_fn2(logits2, batch["record_type"])
         loss = loss1 + loss2
 
         pred1 = torch.argmax(logits1, dim=1)
@@ -439,8 +451,8 @@ class EncoderLightningModuleV1(L.LightningModule):
 
         self.val_preds1.append(pred1.detach().cpu())
         self.val_preds2.append(pred2.detach().cpu())
-        self.val_true1.append(batch["label1"].detach().cpu())
-        self.val_true2.append(batch["label2"].detach().cpu())
+        self.val_true1.append(batch["condition"].detach().cpu())
+        self.val_true2.append(batch["record_type"].detach().cpu())
 
         self.log("val/loss", loss, prog_bar=True, on_step=False, on_epoch=True)
         return loss
@@ -480,17 +492,17 @@ class EncoderLightningModuleV2(L.LightningModule):
         self.save_hyperparameters()
         self.model = AutoModelForMaskedLM.from_pretrained(model_name)
 
-    def forward(self, **batch):
-        return self.model(**batch)
+    def forward(self, input_ids, attention_mask, labels):
+        return self.model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
 
     def training_step(self, batch, batch_idx):
-        outputs = self(**batch)
+        outputs = self(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"], labels=batch["labels"])
         loss = outputs.loss
-        self.log("train/loss", loss, prog_bar=True, on_step=True, on_epoch=True)
+        self.log("train/loss", loss, prog_bar=True, on_step=True, on_epoch=False)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        outputs = self(**batch)
+        outputs = self(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"], labels=batch["labels"])
         loss = outputs.loss
         self.log("val/loss", loss, prog_bar=True, on_step=False, on_epoch=True)
         return loss
@@ -508,35 +520,26 @@ def evaluate_best_v1(
     datamodule: EncoderDataModuleV1,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> Dict[str, float]:
-    model = EncoderLightningModuleV1.load_from_checkpoint(ckpt_path, model_name=datamodule.model_name, num_labels1=datamodule.num_labels1, num_labels2=datamodule.num_labels2)
+    model = EncoderLightningModuleV1.load_from_checkpoint(ckpt_path, model_name=datamodule.tokenizer_name)
     model.to(device)
     model.eval()
-
-    # run on raw test set with tokenizer prompt (as your original)
-    tokenizer = datamodule.tokenizer
-    reverse_condition_map = datamodule.reverse_condition_map
-    reverse_record_type_map = datamodule.reverse_record_type_map
 
     preds_cond, preds_rec = [], []
     true_cond, true_rec = [], []
 
-    for ex in datamodule.dataset_test_raw:
-        inputs = tokenizer(
-            f"Choose the condition and the record type of the following medical note: {ex['text']}",
-            return_tensors="pt",
-            truncation=True,
-            max_length=datamodule.max_length,
-        ).to(device)
+    for batch in datamodule.test_ds:
+        input_ids = torch.tensor(batch["input_ids"], dtype=torch.long).unsqueeze(0).to(device)
+        attention_mask = torch.tensor(batch["attention_mask"], dtype=torch.long).unsqueeze(0).to(device)
 
-        logits1, logits2 = model.model(**inputs)
+        logits1, logits2 = model.model(input_ids=input_ids, attention_mask=attention_mask)
         c = torch.argmax(logits1, dim=1).item()
         r = torch.argmax(logits2, dim=1).item()
 
-        preds_cond.append(reverse_condition_map[c])
-        preds_rec.append(reverse_record_type_map[r])
+        preds_cond.append(c)
+        preds_rec.append(r)
 
-        true_cond.append(ex["condition"])
-        true_rec.append(ex["record_type"])
+        true_cond.append(batch["condition"])
+        true_rec.append(batch["record_type"])
 
     f1_cond = f1_score(true_cond, preds_cond, average="weighted")
     f1_rec = f1_score(true_rec, preds_rec, average="weighted")
@@ -557,28 +560,24 @@ def evaluate_best_v2(
     datamodule: EncoderDataModuleV2,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> Dict[str, float]:
-    model = EncoderLightningModuleV2.load_from_checkpoint(ckpt_path, model_name=datamodule.model_name, lr=datamodule.lr)
+    model = EncoderLightningModuleV2.load_from_checkpoint(ckpt_path, model_name=datamodule.tokenizer_name)
     model.to(device)
     model.eval()
 
     tokenizer = datamodule.tokenizer
-    max_tokens = datamodule.max_tokens
 
     preds_cond, preds_rec = [], []
     true_cond, true_rec = [], []
 
-    for ex in datamodule.dataset_test_raw:
-        prompt = (
-            f"Choose the condition and the record type of the following medical note: {ex['text']}."
-            f" The condition is: {' '.join([tokenizer.mask_token] * max_tokens)};"
-            f" The record type is: {' '.join([tokenizer.mask_token] * max_tokens)}"
-        )
-        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=datamodule.max_length).to(device)
-        outputs = model.model(**inputs)
+    for batch in datamodule.test_ds:
+        input_ids = torch.tensor(batch["input_ids"], dtype=torch.long).unsqueeze(0).to(device)
+        attention_mask = torch.tensor(batch["attention_mask"], dtype=torch.long).unsqueeze(0).to(device)
+
+        outputs = model.model(input_ids=input_ids, attention_mask=attention_mask)
         logits = outputs.logits  # [1, T, V]
 
-        mask_positions = torch.where(inputs["input_ids"] == tokenizer.mask_token_id)[1]
-        pred_ids = inputs["input_ids"].clone().squeeze(0)
+        mask_positions = torch.where(input_ids == tokenizer.mask_token_id)[1]
+        pred_ids = input_ids.clone().squeeze(0)
 
         for pos in mask_positions:
             token_logits = logits[0, pos, :]
@@ -586,17 +585,16 @@ def evaluate_best_v2(
 
         decoded = tokenizer.decode(pred_ids, skip_special_tokens=True).lower()
 
-        # robust-ish parsing (still heuristic, like your original)
         try:
-            cond = decoded.split("the condition is : ")[1].split(";")[0].strip()
-            rec = decoded.split("the record type is : ")[1].strip()
+            cond = decoded.split("the condition is:")[1].split(";")[0].strip()
+            rec = decoded.split("the record type is:")[1].strip()
         except Exception:
             cond, rec = "", ""
 
-        preds_cond.append(cond)
-        preds_rec.append(rec)
-        true_cond.append(ex["condition"].lower())
-        true_rec.append(ex["record_type"].lower())
+        preds_cond.append(datamodule.condition_map.get(cond.title(), -1))
+        preds_rec.append(datamodule.record_type_map.get(rec.title(), -1))
+        true_cond.append(batch["condition"])
+        true_rec.append(batch["record_type"])
 
     f1_cond = f1_score(true_cond, preds_cond, average="weighted")
     f1_rec = f1_score(true_rec, preds_rec, average="weighted")
@@ -674,7 +672,7 @@ def run_encoder_training(
         save_top_k=1,
         monitor=spec.monitor_metric,
         mode=spec.monitor_mode,
-        save_last=True,
+        save_last=False,  # set to True if you also want to keep track of the last epoch's checkpoint (handy for resuming if interrupted, but can use more storage
     )
     earlystop_cb = EarlyStopping(
         monitor=spec.monitor_metric,
@@ -691,10 +689,9 @@ def run_encoder_training(
         accumulate_grad_batches=grad_accum,
         callbacks=[checkpoint_cb, earlystop_cb],
         logger=logger,
-        accelerator="auto",
-        devices="auto",
         log_every_n_steps=log_every_n_steps,
         default_root_dir=ckpt_dir,
+        deterministic=True,
     )
 
     dm.setup()
@@ -704,9 +701,6 @@ def run_encoder_training(
 
     # ---- Resolve best checkpoint, save tokenizer, eval ----
     best_ckpt_path = resolve_best_ckpt(checkpoint_cb, ckpt_dir)
-
-    # Save tokenizer too (easy deployment)
-    dm.tokenizer.save_pretrained(ckpt_dir)
 
     metrics = spec.eval_fn(best_ckpt_path, dm)
     print("\n=== Best checkpoint test metrics ===")
@@ -727,29 +721,29 @@ def main():
     SEED = 42
 
     # Model
-    MODEL_NAME = "Qwen/Qwen3-8B"
+    MODEL_NAME = "answerdotai/ModernBERT-large"
 
     # Tokenization / batching
     MAX_LENGTH = 1028
-    BATCH_SIZE = 1              # per GPU
-    GRAD_ACCUM = 16                   # effective batch = BATCH_SIZE * GRAD_ACCUM
+    BATCH_SIZE = 16              # per GPU
+    GRAD_ACCUM = 1                   # effective batch = BATCH_SIZE * GRAD_ACCUM
 
     # Training
-    LR = 2e-5
-    LOG_EVERY_N_STEPS = 10
-    NUM_EPOCHS = 10
-    EARLY_STOP_PATIENCE = 3
+    LR = 5e-5
+    LOG_EVERY_N_STEPS = 1
+    NUM_EPOCHS = 30
+    EARLY_STOP_PATIENCE = 5
 
     # Precision
     PRECISION = "bf16-mixed"  # if your GPUs support bf16; otherwise use "16-mixed"
 
     # Output
-    SAVE_DIR = "./encoder_finetuning"
+    SAVE_DIR = "/data/outputs/encoder_finetuning"
 
     # Version: 
     # 1: Encoder backbone with classification heads
     # 2: Encoder with masked token prediction-style classification
-    VERSION = 1
+    VERSION = 2
 
     wandb_key = os.getenv("WANDB_KEY")
     if wandb_key:

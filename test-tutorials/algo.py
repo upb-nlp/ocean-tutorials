@@ -252,7 +252,7 @@ class EncoderDataModuleV2(L.LightningDataModule):
 
     def prepare_data(self):
         # Load dataset and tokenizer
-        load_dataset(self.dataset_name, split=self.train_split)
+        load_dataset(self.dataset_name)
         AutoTokenizer.from_pretrained(self.tokenizer_name)
 
     def setup(self, stage: Optional[str] = None):
@@ -343,6 +343,8 @@ class EncoderDataModuleV2(L.LightningDataModule):
         inputs["input_ids"] = torch.tensor(inputs["input_ids"], dtype=torch.long)
         inputs["attention_mask"] = torch.tensor(inputs["attention_mask"], dtype=torch.long)
         inputs["labels"] = torch.tensor(labels, dtype=torch.long)
+        inputs["condition"] = torch.tensor(self.condition_map[example["condition"]], dtype=torch.long)
+        inputs["record_type"] = torch.tensor(self.record_type_map[example["record_type"]], dtype=torch.long)
 
         return inputs
 
@@ -362,10 +364,16 @@ class EncoderDataModuleV2(L.LightningDataModule):
             batch_first=True,
             padding_value=-100,
         )
+        condition = torch.stack([torch.tensor(ex["condition"]) for ex in batch])
+        record_type = torch.stack([torch.tensor(ex["record_type"]) for ex in batch])
+
+
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "labels": labels,
+            "condition": condition,
+            "record_type": record_type,
         }
 
     def train_dataloader(self):
@@ -484,17 +492,17 @@ class EncoderLightningModuleV2(L.LightningModule):
         self.save_hyperparameters()
         self.model = AutoModelForMaskedLM.from_pretrained(model_name)
 
-    def forward(self, **batch):
-        return self.model(**batch)
+    def forward(self, input_ids, attention_mask, labels):
+        return self.model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
 
     def training_step(self, batch, batch_idx):
-        outputs = self(**batch)
+        outputs = self(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"], labels=batch["labels"])
         loss = outputs.loss
         self.log("train/loss", loss, prog_bar=True, on_step=True, on_epoch=False)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        outputs = self(**batch)
+        outputs = self(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"], labels=batch["labels"])
         loss = outputs.loss
         self.log("val/loss", loss, prog_bar=True, on_step=False, on_epoch=True)
         return loss
@@ -569,7 +577,6 @@ def evaluate_best_v2(
         logits = outputs.logits  # [1, T, V]
 
         mask_positions = torch.where(input_ids == tokenizer.mask_token_id)[1]
-        print(mask_positions, tokenizer.mask_token_id, tokenizer.mask_token, input_ids)
         pred_ids = input_ids.clone().squeeze(0)
 
         for pos in mask_positions:
@@ -579,16 +586,15 @@ def evaluate_best_v2(
         decoded = tokenizer.decode(pred_ids, skip_special_tokens=True).lower()
 
         try:
-            cond = decoded.split("the condition is: ")[1].split(";")[0].strip()
-            rec = decoded.split("the record type is: ")[1].strip()
+            cond = decoded.split("the condition is:")[1].split(";")[0].strip()
+            rec = decoded.split("the record type is:")[1].strip()
         except Exception:
             cond, rec = "", ""
 
-        preds_cond.append(cond)
-        preds_rec.append(rec)
-        true_cond.append(batch["condition"].lower())
-        true_rec.append(batch["record_type"].lower())
-        print(cond, rec, batch["condition"], batch["record_type"])
+        preds_cond.append(datamodule.condition_map.get(cond.title(), -1))
+        preds_rec.append(datamodule.record_type_map.get(rec.title(), -1))
+        true_cond.append(batch["condition"])
+        true_rec.append(batch["record_type"])
 
     f1_cond = f1_score(true_cond, preds_cond, average="weighted")
     f1_rec = f1_score(true_rec, preds_rec, average="weighted")
