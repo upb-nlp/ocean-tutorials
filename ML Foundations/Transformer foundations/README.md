@@ -460,7 +460,7 @@ pip install protobuf
 ### Quick Start
 
 ```bash
-# Run entirely
+# Run entirely (inside the virtual environment)
 python transformer_foundations.py
 
 # Or run individual sections
