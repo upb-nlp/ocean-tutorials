@@ -62,7 +62,7 @@ Effective visualization manipulates the ways humans organize and interpret visua
 - Connection, such as linking points with lines, strongly communicates relationship or sequence, often more powerfully than proximity alone. 
 - Finally, continuity reflects our tendency to follow smooth, continuous lines or patterns, which helps viewers interpret trends within line charts or flow diagrams. 
 
-![Gestalt](./images/gestalt_energy_trends.png)
+![Gestalt](./images/gestalt_principles.png)
 
 ## Data-Ink Ratio
 
