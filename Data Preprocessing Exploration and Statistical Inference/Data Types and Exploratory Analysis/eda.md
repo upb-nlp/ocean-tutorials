@@ -272,4 +272,4 @@ pip install pandas numpy matplotlib seaborn scipy
 | `numpy` | Numerical arrays, log transforms, random data generation |
 | `matplotlib` | All plot creation and annotation |
 | `seaborn` | Heatmap for correlation matrix |
-| `scipy` | Skewness calculation (`scipy.stats.skew`) |
+| `scipy` | Skewness calculation |
