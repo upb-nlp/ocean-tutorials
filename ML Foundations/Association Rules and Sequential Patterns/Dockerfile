@@ -1,0 +1,20 @@
+FROM ubuntu:24.04
+
+RUN apt-get update && \
+    apt-get install -y \
+    python3-pip \
+    python3-venv \
+    default-jre-headless \
+    && apt-get clean
+
+RUN python3 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+COPY requirements.txt /tmp/
+RUN pip install --upgrade pip wheel
+RUN pip install -r /tmp/requirements.txt
+
+WORKDIR /app
+COPY association_rules.py .
+
+CMD ["python3", "association_rules.py"]
