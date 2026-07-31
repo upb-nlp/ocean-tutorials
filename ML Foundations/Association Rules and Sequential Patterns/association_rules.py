@@ -10,7 +10,7 @@ Run all labs:
 Run a single lab:
     python association_rules.py --lab 1   # Items, transactions, support, confidence
     python association_rules.py --lab 2   # Apriori - mlxtend
-    python association_rules.py --lab 3   # FP-Growth - mlxtend (+ optional Spark)
+    python association_rules.py --lab 3   # FP-Growth - mlxtend
     python association_rules.py --lab 4   # Class Association Rules (CARs)
     python association_rules.py --lab 5   # Sequential Patterns + visualisations
 """
@@ -420,30 +420,20 @@ def lab3_fpgrowth():
     )
 
     # -- 3.5  Optional Spark FP-Growth ---------------------------------------
-    subsection("3.5  Optional - Spark FP-Growth on the colab dataset")
-    try:
-        from pyspark.sql import SparkSession
-        from pyspark.ml.fpm import FPGrowth
-        spark = (SparkSession.builder
-                 .appName("frequent_mining")
-                 .master("local[*]")
-                 .getOrCreate())
-        sdf = spark.createDataFrame(
-            [(i, items) for i, items in enumerate(ABCDE_DATASET)],
-            ["id", "items"],
-        )
-        model = FPGrowth(itemsCol="items", minSupport=0.4, minConfidence=1.0).fit(sdf)
-        print("    Frequent itemsets:")
-        for r in model.freqItemsets.collect():
-            print(f"      {sorted(r['items'])} -> freq={r['freq']}")
-        print("    Association rules:")
-        for r in model.associationRules.collect():
-            print(f"      {sorted(r['antecedent'])} -> {sorted(r['consequent'])}"
-                  f"  conf={r['confidence']:.2f}")
-        spark.stop()
-    except Exception as e:
-        print(f"    Spark not available ({type(e).__name__}) - skipping.")
-        print("    Install with: pip install pyspark  (requires a JDK)")
+    subsection("3.5  Cross-check with mlxtend Apriori")
+    print("    Verifying FP-Growth and Apriori produce the same frequent itemsets\n")
+    arr = te.fit(ABCDE_DATASET).transform(ABCDE_DATASET)
+    df_check = pd.DataFrame(arr, columns=te.columns_)
+    fi_ap = apriori(df_check, min_support=0.4, use_colnames=True)
+    fi_fp = fpgrowth(df_check, min_support=0.4, use_colnames=True)
+    ap_sets = set(frozenset(x) for x in fi_ap["itemsets"])
+    fp_sets = set(frozenset(x) for x in fi_fp["itemsets"])
+    if ap_sets == fp_sets:
+        print(f"    OK - both algorithms found the same {len(ap_sets)} frequent itemsets.")
+    else:
+        print(f"    MISMATCH - Apriori: {len(ap_sets)}, FP-Growth: {len(fp_sets)}")
+        print(f"    Only in Apriori: {ap_sets - fp_sets}")
+        print(f"    Only in FP-Growth: {fp_sets - ap_sets}")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -648,7 +638,7 @@ def lab5_sequential_and_viz():
     section("5 - SEQUENTIAL PATTERNS + VISUALISATIONS")
     print(textwrap.dedent("""
       Mine sequential patterns on the two example databases with a small
-      built-in GSP miner, optionally cross-check with pyspark.ml.fpm.PrefixSpan,
+      built-in GSP miner, cross-check with the prefixspan library (PrefixSpan),
       then produce the full suite of plots.
     """))
 
@@ -685,24 +675,21 @@ def lab5_sequential_and_viz():
     show_table(["Pattern", "Count"], rows, col_width=24)
 
     # -- 5.4  Optional: pyspark PrefixSpan -----------------------------------
-    subsection("5.4  Optional - Spark PrefixSpan")
-    try:
-        from pyspark.sql import SparkSession, Row
-        from pyspark.ml.fpm import PrefixSpan
-        spark = (SparkSession.builder
-                 .appName("prefix_span")
-                 .master("local[*]")
-                 .getOrCreate())
-        rows = [Row(sequence=s) for s in SEQ_DATASET]
-        sdf = spark.sparkContext.parallelize(rows).toDF()
-        ps = PrefixSpan(minSupport=0.5, maxPatternLength=5)
-        out = ps.findFrequentSequentialPatterns(sdf).sort("sequence").collect()
-        for r in out:
-            print(f"    {_fmt_seq([tuple(ev) for ev in r['sequence']])}"
-                  f"  freq={r['freq']}")
-        spark.stop()
-    except Exception as e:
-        print(f"    Spark not available ({type(e).__name__}) - skipping.")
+    subsection("5.4  PrefixSpan cross-check")
+    require(["prefixspan"])
+    from prefixspan import PrefixSpan
+    db = [
+        [item for ev in seq for item in ev]
+        for seq in SEQ_DATASET
+    ]
+    ps = PrefixSpan(db)
+    ps.minlen = 1
+    ps.maxlen = 5
+    min_count = int(len(SEQ_DATASET) * 0.5)
+    ps_results = ps.frequent(min_count)
+    print(f"    PrefixSpan found {len(ps_results)} patterns (minsup count >= {min_count}):\n")
+    for count, pat in sorted(ps_results, key=lambda x: (-x[0], x[1])):
+        print(f"      <{', '.join(str(p) for p in pat)}>  count={count}")
 
     # -- 5.5  Visualisations -------------------------------------------------
     subsection("5.5  Saving visualisations to ./outputs/association_rules/")
@@ -763,18 +750,46 @@ def _plot_rules_scatter(rules, save_path):
     if rules.empty:
         print("  rules_scatter.png        -> skipped (no rules)")
         return
-    fig, ax = plt.subplots(figsize=(8, 6))
-    sc = ax.scatter(rules["support"], rules["confidence"],
-                    c=rules["lift"], cmap="viridis", s=80,
-                    edgecolors="k", linewidths=0.5)
-    plt.colorbar(sc, ax=ax, label="lift")
+    from collections import defaultdict as _ddict
+    fig, ax = plt.subplots(figsize=(11, 7))
+
+    # Group rules that share the same (support, confidence) coordinate
+    groups = _ddict(list)
     for _, r in rules.iterrows():
+        label = (", ".join(sorted(r["antecedents"])) + " → "
+                 + ", ".join(sorted(r["consequents"])))
+        key = (round(r["support"], 4), round(r["confidence"], 4))
+        groups[key].append(label)
+
+    x = rules["support"].values
+    y = rules["confidence"].values
+    sc = ax.scatter(x, y, c=rules["lift"], cmap="viridis", s=80,
+                    edgecolors="k", linewidths=0.5, zorder=3)
+    plt.colorbar(sc, ax=ax, label="lift")
+
+    # Place one annotation box per unique coordinate, stacking rules vertically
+    placed = set()
+    offsets = {
+        (0.4, 1.0):   (120, -30),
+        (0.4, 0.667): (120, 30),
+    }
+    default_offset = (15, 10)
+    for (sx, sy), rule_labels in groups.items():
+        if (sx, sy) in placed:
+            continue
+        placed.add((sx, sy))
+        text = "\n".join(rule_labels)
+        ofs = offsets.get((round(sx, 1), round(sy, 3)), default_offset)
         ax.annotate(
-            ", ".join(sorted(r["antecedents"])) + "->" +
-            ", ".join(sorted(r["consequents"])),
-            (r["support"], r["confidence"]),
-            xytext=(4, 4), textcoords="offset points", fontsize=7,
+            text, (sx, sy),
+            xytext=ofs, textcoords="offset points",
+            fontsize=7, linespacing=1.6,
+            bbox=dict(boxstyle="round,pad=0.4", fc="white", ec="#aaaaaa",
+                      alpha=0.9),
+            arrowprops=dict(arrowstyle="-", color="#aaaaaa", lw=0.8),
+            zorder=5,
         )
+
     ax.set_xlabel("Support")
     ax.set_ylabel("Confidence")
     ax.set_title("Support x Confidence (colour = lift)")
@@ -929,7 +944,7 @@ def main():
         help=(
             "Run a specific lab "
             "(1=basics, 2=Apriori, 3=FP-Growth, 4=CARs, "
-            "5=Sequential patterns + plots)"
+            "5=Sequential patterns (GSP + PrefixSpan) + plots)"
         ),
     )
     args = parser.parse_args()
@@ -941,9 +956,9 @@ def main():
   Labs:
     1 -> Items, transactions, support, confidence
     2 -> Apriori (mlxtend)
-    3 -> FP-Growth (mlxtend) + optional Spark
+    3 -> FP-Growth (mlxtend)
     4 -> Class Association Rules (CARs) + CBA classifier
-    5 -> Sequential Patterns + visualisations
+    5 -> Sequential Patterns (GSP + PrefixSpan) + visualisations
     """)
 
     labs = {

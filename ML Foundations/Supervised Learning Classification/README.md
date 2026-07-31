@@ -66,6 +66,9 @@ Fold 4: [        train       ][  val  ]
 | **2-fold** | Uses large train *and* test sets in each round. |
 | **Bootstrap** | Sample $n$ training examples with replacement; ~36.8 % of points are never picked and form the test set. |
 
+<p align="center"><img src="outputs/classification/cv_results.png" width="80%"></p>
+<p align="center"><em>5-fold cross-validation accuracy for every classifier — the box shows the spread across folds, not just the mean.</em></p>
+
 ### 1.4 The Confusion Matrix (Binary)
 
 For a binary problem with a "positive" class (e.g., *malignant*) and a "negative" class (e.g., *benign*), the predictions and ground truth assemble a **confusion matrix**:
@@ -80,6 +83,9 @@ Actual Negative          FP                  TN
 - **TN** — true negatives, correctly predicted negatives
 - **FP** — false positives ("false alarm")
 - **FN** — false negatives ("missed detection")
+
+<p align="center"><img src="outputs/classification/confusion_matrices.png" width="95%"></p>
+<p align="center"><em>Confusion matrix for each classifier on the test set — the diagonal is correct predictions, off-diagonal are the mistakes.</em></p>
 
 ### 1.5 Binary Metrics
 
@@ -127,6 +133,9 @@ A **lift curve** plots the cumulative fraction of true positives captured agains
    0 ┼───────────────────────  → % population targeted
      0       50        100
 ```
+
+<p align="center"><img src="outputs/classification/roc_curves.png" width="70%"></p>
+<p align="center"><em>ROC curves with AUC for every classifier — closer to the top-left corner is better; the diagonal is random guessing.</em></p>
 
 ## 2. K-Nearest Neighbors
 
@@ -529,6 +538,9 @@ This **decorrelates** the trees — without it, every tree would pick the same d
 
 Random Forests also provide **feature importance** (mean impurity decrease across all trees), an out-of-the-box interpretability tool.
 
+<p align="center"><img src="outputs/classification/feature_importance.png" width="85%"></p>
+<p align="center"><em>Feature importances from the tree ensembles (Random Forest / XGBoost) — which measurements drive the predictions.</em></p>
+
 ### 7.3 Boosting
 
 Boosting builds trees **sequentially**. Each new tree focuses on the examples the previous ensemble got wrong:
@@ -617,6 +629,12 @@ Need a calibrated probability?       → Logistic regression, calibrated SVM/RF
 ```
 
 A rough mental model for the *no free lunch* theorem: there is no single classifier that wins on every dataset. The right move is to benchmark several on a held-out validation set.
+
+<p align="center"><img src="outputs/classification/metrics_comparison.png" width="85%"></p>
+<p align="center"><em>Accuracy, precision, recall and F1 side by side across all classifiers on the test set.</em></p>
+
+<p align="center"><img src="outputs/classification/decision_boundaries.png" width="95%"></p>
+<p align="center"><em>Each classifier's decision boundary in PCA-projected 2-D space — a visual intuition for how differently the models carve up the feature space.</em></p>
 
 ## Tutorial
 

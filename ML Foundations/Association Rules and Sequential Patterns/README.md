@@ -44,6 +44,9 @@ Doc6 = {rule, tree, recommendation}
 - $\mathrm{sup}(\{rule, tree\}) = 3 / 6 = 50\%$ → **frequent** at $s = 50\%$.
 - $\mathrm{sup}(\{relation, join\}) = 2 / 6 = 33\%$ → **not frequent** at $s = 50\%$.
 
+<p align="center"><img src="outputs/association_rules/item_cooccurrence.png" width="70%"></p>
+<p align="center"><em>Item × item co-occurrence heatmap — how often each pair of items appears together in the transactions.</em></p>
+
 ### 1.2 Association Rules
 
 For two disjoint itemsets $X, Y \subseteq I$, an **association rule** is written $X \rightarrow Y$. We call $X$ the *antecedent* and $Y$ the *consequent*. Two key quality metrics:
@@ -78,6 +81,9 @@ High confidence alone is misleading: `bread → milk` may have 90 % confidence s
 
 A rule with `conf = 90 %, lift = 1.0` is uninformative; one with `conf = 50 %, lift = 5.0` is *much* more interesting.
 
+<p align="center"><img src="outputs/association_rules/rules_scatter.png" width="80%"></p>
+<p align="center"><em>Every mined rule plotted by support × confidence, coloured by lift — the top-right, brightly-coloured rules are the strong ones.</em></p>
+
 ### 1.4 Goals for Mining Transactions
 
 ```
@@ -100,6 +106,9 @@ A rule with `conf = 90 %, lift = 1.0` is uninformative; one with `conf = 50 %, l
 - *"People who buy gin are likely to buy tonic water and lemons."*
 - *"On Friday afternoons, young American males who buy diapers also buy beer."*
 - Causal use: keep `diapers` cheap (attracts buyers) and `beer` priced for margin.
+
+<p align="center"><img src="outputs/association_rules/rules_network.png" width="80%"></p>
+<p align="center"><em>The top-N rules as a graph: nodes are items, arrows point antecedent → consequent.</em></p>
 
 ### 1.5 Why Specialised Algorithms
 
@@ -228,6 +237,9 @@ Transaction database with $|T| = 9$, **min support count = 2**:
 | `I2 → {I1, I3}` | $2 / 7 = 28\%$ | ❌ |
 | `I3 → {I1, I2}` | $2 / 6 = 33\%$ | ❌ |
 
+<p align="center"><img src="outputs/association_rules/itemset_support.png" width="80%"></p>
+<p align="center"><em>Support of the frequent itemsets Apriori discovers — the bars are exactly the itemsets that clear the minimum-support threshold.</em></p>
+
 ### 2.7 Strengths and Weaknesses
 
 | ✅ Pros | ❌ Cons |
@@ -330,6 +342,9 @@ After processing every item in the F-list, the final frequent itemset table is:
 | Worst case | Long frequent itemsets | Dense data → huge tree |
 | Implementation | Simple | More involved |
 | Typical real-world speed | Slow | **5–10× faster** |
+
+<p align="center"><img src="outputs/association_rules/algo_runtime.png" width="70%"></p>
+<p align="center"><em>Apriori vs FP-Growth wall-clock on the same data — FP-Growth avoids repeated candidate generation and pulls ahead as the problem grows.</em></p>
 
 ## 4. Class Association Rules (CARs)
 
@@ -465,6 +480,9 @@ prefix-span(prefix α, projected DB D_α):
 
 The recursion explores the same lattice as GSP but **never builds candidate sets**, so it is dramatically faster on real workloads.
 
+<p align="center"><img src="outputs/association_rules/sequence_lengths.png" width="70%"></p>
+<p align="center"><em>Distribution of the lengths of the sequential patterns mined by PrefixSpan.</em></p>
+
 ## 6. Choosing the Right Algorithm
 
 ```
@@ -496,7 +514,7 @@ Or a specific one:
 ```bash
 python association_rules.py --lab 1   # Items, transactions, support, confidence
 python association_rules.py --lab 2   # Apriori - mlxtend
-python association_rules.py --lab 3   # FP-Growth - mlxtend (+ optional Spark)
+python association_rules.py --lab 3   # FP-Growth - mlxtend
 python association_rules.py --lab 4   # Class Association Rules (CARs)
 python association_rules.py --lab 5   # Sequential Patterns + visualisations
 ```
@@ -505,9 +523,9 @@ python association_rules.py --lab 5   # Sequential Patterns + visualisations
 
 1. **Lab 1** - define small transaction databases (`Doc1…Doc6`, T1…T9), compute support / confidence / lift / conviction by hand and by formula.
 2. **Lab 2** - Apriori with `mlxtend.frequent_patterns.apriori`. Reproduce the T1…T9 walk-through and the `[A,B], [A,B,D], [B,D], [B,C,D,E], [A,B,C,D]` ToDo example.
-3. **Lab 3** - FP-Growth with `mlxtend.frequent_patterns.fpgrowth`. Compare to Apriori on the 10-transaction dataset; optional Spark FP-Growth.
+3. **Lab 3** - FP-Growth with `mlxtend.frequent_patterns.fpgrowth`. Compare to Apriori on the 10-transaction dataset; cross-check that both algorithms produce identical itemsets.
 4. **Lab 4** - modify the Apriori miner to enforce a single class label on the right-hand side; build a CBA-style classifier on the labelled documents.
-5. **Lab 5** - sequential patterns via a built-in GSP miner (or `pyspark.ml.fpm.PrefixSpan`). Mine the two sequence databases; produce a suite of comparison plots:
+5. **Lab 5** - sequential patterns via a built-in GSP miner and `prefixspan` (PrefixSpan). Mine the two sequence databases; produce a suite of comparison plots:
    - Frequent itemset support bar chart
    - Top-N association rules table
    - Support–confidence and support–lift scatter plots
@@ -531,12 +549,7 @@ pip install -r requirements.txt
 
 ### Outputs
 
-```
-outputs/association_rules/
-├── itemset_support.png         ← bar chart of frequent itemset support
-├── rules_scatter.png           ← support × confidence (colour = lift)
-├── rules_network.png           ← rule graph of top-N rules
-├── item_cooccurrence.png       ← item × item co-occurrence heatmap
-├── algo_runtime.png            ← Apriori vs FP-Growth wall-clock
-└── sequence_lengths.png        ← histogram of mined sequential pattern lengths
-```
+All plots are written to `outputs/association_rules/` (and are shown inline in
+the sections above): `itemset_support.png`, `rules_scatter.png`,
+`rules_network.png`, `item_cooccurrence.png`, `algo_runtime.png`,
+`sequence_lengths.png`.

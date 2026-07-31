@@ -6,3 +6,7 @@ HEAD
 **/.env
 ca6b95f0d8734c4165af7baf119b950696cff23f
 .Rhistory
+**/ML Foundations/Association Rules and Sequential Patterns/arsp-course
+**/ML Foundations/Supervised Learning Classification/classification-course
+**/ML Foundations/Supervised Learning Regression/regression-course
+**/ML Foundations/Model Selection Evaluation and Deployment/model-course

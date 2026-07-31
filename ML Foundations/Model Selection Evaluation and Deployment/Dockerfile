@@ -14,6 +14,10 @@ RUN pip install --upgrade pip wheel
 RUN pip install -r /tmp/requirements.txt
 
 WORKDIR /app
-COPY association_rules.py .
+COPY model_selection.py .
 
-CMD ["python3", "association_rules.py"]
+RUN mkdir -p outputs/model_selection
+
+# optuna (Bayesian search) and shap (interpretability) are optional — the
+# script degrades gracefully if they are absent, but the image installs them.
+CMD ["python3", "model_selection.py"]

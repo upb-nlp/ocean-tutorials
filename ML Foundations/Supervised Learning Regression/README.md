@@ -62,6 +62,12 @@ Let $y_i$ be the true value and $\hat{y}_i$ the prediction.
 | **$R^2$** | $1 - \dfrac{\sum_i (y_i - \hat{y}_i)^2}{\sum_i (y_i - \bar{y})^2}$ | Fraction of variance explained; 1 = perfect, 0 = mean baseline |
 | **MAPE** | $\tfrac{1}{n}\sum_i \left\lvert \tfrac{y_i - \hat{y}_i}{y_i} \right\rvert$ | Scale-free; breaks when $y_i \approx 0$ |
 
+<p align="center"><img src="outputs/regression/predictions_vs_actual.png" width="90%"></p>
+<p align="center"><em>Predicted vs actual for each regressor — points on the diagonal are perfect predictions.</em></p>
+
+<p align="center"><img src="outputs/regression/residuals.png" width="90%"></p>
+<p align="center"><em>Residual plots — residuals should scatter randomly around zero; patterns reveal bias or heteroscedasticity.</em></p>
+
 ## 2. Linear Regression
 
 ### 2.1 The Model
@@ -173,6 +179,9 @@ M = 3  ──→  smooth cubic                     (often a good compromise)
 M = 9  ──→  passes through every point       (over-fit - wild oscillations)
 ```
 
+<p align="center"><img src="outputs/regression/polynomial_fits.png" width="85%"></p>
+<p align="center"><em>Polynomial fits of increasing degree — low degrees underfit, high degrees wiggle through the noise (overfit).</em></p>
+
 ### 3.3 Over-fitting and the RMS Curve
 
 The Root-Mean-Square error
@@ -190,6 +199,9 @@ drops to zero on the **training set** as $M$ grows - the model memorises the poi
 | Very high (over-fit) | -> 0 | high |
 
 The "U" shape of the test curve - low for moderate $M$, large at both ends - is the canonical **bias-variance trade-off** picture. See `polynomial_fits.png` in the tutorial outputs: degree 1 under-fits, degree 12 fits well, degree 16 oscillates wildly.
+
+<p align="center"><img src="outputs/regression/learning_curve.png" width="75%"></p>
+<p align="center"><em>Train vs test RMSE as the training set grows — a persistent gap signals high variance; more data helps close it.</em></p>
 
 ### 3.4 Remedies for Over-fitting
 
@@ -255,6 +267,9 @@ $$
 
 with $\rho \in [0, 1]$ controlling the mix. It retains lasso's sparsity while sharing weight across correlated features - a good default when $d > n$ or features form groups.
 
+<p align="center"><img src="outputs/regression/regularization_paths.png" width="85%"></p>
+<p align="center"><em>Ridge vs Lasso coefficient paths as the penalty α grows — Ridge shrinks smoothly, Lasso drives coefficients to exactly zero.</em></p>
+
 ### 4.5 Summary
 
 | Method | Penalty | Closed-form? | Sparse $w$? | Use when… |
@@ -265,6 +280,9 @@ with $\rho \in [0, 1]$ controlling the mix. It retains lasso's sparsity while sh
 | **Elastic Net** | $\rho \lVert w \rVert_1 + (1-\rho)\lVert w \rVert_2^2$ | ❌ (CD) | ✅ (less aggressive) | correlated features; $d > n$ |
 
 **Always standardise features** before regularised regression - the penalty would otherwise punish features with large numeric scale disproportionately.
+
+<p align="center"><img src="outputs/regression/alpha_sweep.png" width="75%"></p>
+<p align="center"><em>Validation RMSE vs the regularisation strength α for Ridge, Lasso and Elastic Net — the dip marks the best α.</em></p>
 
 ## 5. Bayesian Linear Regression (a short detour)
 
@@ -355,6 +373,9 @@ The **learning rate** $\eta$ (shrinkage) trades off the contribution of each tre
 
 **XGBoost** (and LightGBM, CatBoost) add a second-order Taylor expansion, leaf-weight regularisation, sparsity-aware splits and histogram bucketing - they dominate tabular regression leaderboards.
 
+<p align="center"><img src="outputs/regression/feature_importance.png" width="85%"></p>
+<p align="center"><em>Feature importances from the tree ensembles (Random Forest / Gradient Boosting / XGBoost).</em></p>
+
 ### 6.5 Strengths and Weaknesses
 
 | ✅ Pros | ❌ Cons |
@@ -378,6 +399,12 @@ Heavy outliers in the target?                 → MAE-based (Huber, MAE tree)
 ```
 
 Like with classification, the *no free lunch* theorem applies: benchmark a handful of models on a held-out set, then pick.
+
+<p align="center"><img src="outputs/regression/metrics_comparison.png" width="85%"></p>
+<p align="center"><em>RMSE, MAE and R² side by side across every regressor.</em></p>
+
+<p align="center"><img src="outputs/regression/cv_results.png" width="80%"></p>
+<p align="center"><em>5-fold cross-validation R² distribution for each regressor.</em></p>
 
 ## Tutorial
 
